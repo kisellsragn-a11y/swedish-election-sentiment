@@ -1,13 +1,20 @@
 import os
 import sqlite3
-import threading
-from datetime import datetime, timezone
+import time
+from datetime import datetime
 from collections import Counter
 
 import pandas as pd
+import requests
+import praw
+
+from googleapiclient.discovery import build
+from transformers import pipeline
+
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+from wordcloud import WordCloud
 
 
 # ============================================================
@@ -17,7 +24,7 @@ import plotly.graph_objects as go
 st.set_page_config(
     page_title="Swedish Election Sentiment 2026",
     page_icon="🇸🇪",
-    layout="wide",
+    layout="wide"
 )
 
 
@@ -25,61 +32,196 @@ st.set_page_config(
 # CONFIGURATION
 # ============================================================
 
-DB_PATH = "swedish_election_2026.db"
-
-# IMPORTANT:
-# We intentionally DO NOT use the old:
-# cardiffnlp/twitter-xlm-roberta-base-sentiment
-#
-# That model was causing your sentencepiece.bpe.model error.
-#
-# This model is multilingual and uses DistilBERT.
-SENTIMENT_MODEL = "lxyuan/distilbert-base-multilingual-cased-sentiments-student"
-
-
 SWEDISH_PARTIES = {
     "Socialdemokraterna": {
         "leader": "Magdalena Andersson",
         "abbrev": "S",
-        "bloc": "left",
+        "bloc": "left"
     },
     "Moderaterna": {
         "leader": "Ulf Kristersson",
         "abbrev": "M",
-        "bloc": "right",
+        "bloc": "right"
     },
     "Sverigedemokraterna": {
         "leader": "Jimmie Åkesson",
         "abbrev": "SD",
-        "bloc": "right",
+        "bloc": "right"
     },
     "Kristdemokraterna": {
         "leader": "Ebba Busch",
         "abbrev": "KD",
-        "bloc": "right",
+        "bloc": "right"
     },
     "Liberalerna": {
         "leader": "Johan Pehrson",
         "abbrev": "L",
-        "bloc": "right",
+        "bloc": "right"
     },
     "Centerpartiet": {
         "leader": "Muharrem Demirok",
         "abbrev": "C",
-        "bloc": "center",
+        "bloc": "center"
     },
     "Miljöpartiet": {
         "leader": "Amanda Lind",
         "abbrev": "MP",
-        "bloc": "left",
+        "bloc": "left"
     },
     "Vänsterpartiet": {
         "leader": "Nooshi Dadgostar",
         "abbrev": "V",
-        "bloc": "left",
+        "bloc": "left"
     },
 }
 
+
+# ============================================================
+# API SECRETS
+# ============================================================
+
+try:
+    REDDIT_CLIENT_ID = st.secrets.get(
+        "REDDIT_CLIENT_ID",
+        os.environ.get("REDDIT_CLIENT_ID", "")
+    )
+
+    REDDIT_CLIENT_SECRET = st.secrets.get(
+        "REDDIT_CLIENT_SECRET",
+        os.environ.get("REDDIT_CLIENT_SECRET", "")
+    )
+
+    YOUTUBE_API_KEY = st.secrets.get(
+        "YOUTUBE_API_KEY",
+        os.environ.get("YOUTUBE_API_KEY", "")
+    )
+
+except Exception:
+    REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID", "")
+    REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "")
+    YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+DB_PATH = "swedish_election_2026.db"
+
+
+def get_connection():
+    """
+    Create a SQLite connection designed for Streamlit.
+
+    WAL + busy_timeout greatly reduces 'database is locked'
+    errors when Streamlit reruns the app.
+    """
+
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        check_same_thread=False
+    )
+
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+
+    return conn
+
+
+def execute_with_retry(operation, retries=5, delay=0.5):
+    """
+    Retry SQLite operations if another operation temporarily
+    has the database locked.
+    """
+
+    last_error = None
+
+    for attempt in range(retries):
+        try:
+            return operation()
+
+        except sqlite3.OperationalError as e:
+            last_error = e
+
+            if "locked" not in str(e).lower():
+                raise
+
+            if attempt < retries - 1:
+                time.sleep(delay * (attempt + 1))
+
+    raise last_error
+
+
+def init_database():
+
+    def _init():
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reddit_posts (
+                id TEXT PRIMARY KEY,
+                source TEXT DEFAULT 'reddit',
+                subreddit TEXT,
+                author TEXT,
+                title TEXT,
+                text TEXT,
+                score INTEGER,
+                num_comments INTEGER,
+                created_utc REAL,
+                url TEXT,
+                permalink TEXT,
+                sentiment_label TEXT,
+                sentiment_score REAL,
+                party_mentioned TEXT,
+                issue_mentioned TEXT,
+                collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS youtube_comments (
+                id TEXT PRIMARY KEY,
+                source TEXT DEFAULT 'youtube',
+                video_id TEXT,
+                video_title TEXT,
+                author TEXT,
+                text TEXT,
+                like_count INTEGER,
+                published_at TEXT,
+                sentiment_label TEXT,
+                sentiment_score REAL,
+                party_mentioned TEXT,
+                issue_mentioned TEXT,
+                collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sentiment_summary (
+                date TEXT PRIMARY KEY,
+                total_posts INTEGER,
+                positive_count INTEGER,
+                negative_count INTEGER,
+                neutral_count INTEGER,
+                avg_sentiment REAL,
+                top_positive TEXT,
+                top_negative TEXT
+            )
+        """)
+
+        conn.commit()
+        conn.close()
+
+    execute_with_retry(_init)
+
+
+# ============================================================
+# SEARCH TERMS
+# ============================================================
 
 SEARCH_TERMS = [
     "riksdagsval 2026",
@@ -119,7 +261,7 @@ SUBREDDITS = [
     "svenska",
     "europe",
     "worldnews",
-    "politics",
+    "politics"
 ]
 
 
@@ -130,327 +272,621 @@ YOUTUBE_QUERIES = [
     "Magdalena Andersson",
     "Ulf Kristersson",
     "Jimmie Åkesson",
-    "Sverigedemokraterna",
+    "Sverigedemokraterna"
 ]
 
 
 # ============================================================
-# API SECRETS
+# SWEDISH STOP WORDS
 # ============================================================
 
-def get_secret(name, default=""):
-    """
-    Get a Streamlit secret first, then environment variable.
-    """
-    try:
-        value = st.secrets.get(name)
-        if value:
-            return str(value)
-    except Exception:
-        pass
-
-    return os.environ.get(name, default)
-
-
-REDDIT_CLIENT_ID = get_secret("REDDIT_CLIENT_ID")
-REDDIT_CLIENT_SECRET = get_secret("REDDIT_CLIENT_SECRET")
-YOUTUBE_API_KEY = get_secret("YOUTUBE_API_KEY")
-
-
-# ============================================================
-# SQLITE HELPERS
-# ============================================================
-
-_db_lock = threading.RLock()
+SWEDISH_STOPWORDS = {
+    "och", "att", "det", "som", "för", "är", "en", "ett",
+    "den", "de", "av", "på", "i", "till", "med", "om",
+    "har", "jag", "du", "han", "hon", "vi", "ni", "man",
+    "inte", "men", "så", "kan", "ska", "var", "vara",
+    "blir", "blev", "där", "här", "från", "eller", "efter",
+    "innan", "också", "bara", "alla", "något", "någon",
+    "några", "mycket", "mer", "mest", "sin", "sitt", "sina",
+    "denna", "detta", "dessa", "ett", "en", "mig", "dig",
+    "sig", "oss", "er", "dom", "då", "nu", "ut", "upp",
+    "ned", "ner", "över", "under", "igen", "väl", "ju",
+    "så", "vad", "hur", "varför", "vem", "vilken", "vilket",
+    "vilka", "än", "också", "får", "få", "gör", "gjort",
+    "göra", "går", "gick", "kom", "kommer", "kommer",
+    "säger", "sa", "hade", "haft", "skulle", "kunna",
+    "måste", "bör", "blir", "blivit", "är", "varit",
+    "the", "and", "that", "this", "with", "from", "for",
+    "you", "your", "they", "them", "have", "has", "not"
+}
 
 
-def get_connection():
-    """
-    Create a SQLite connection configured to reduce
-    'database is locked' errors.
-    """
-    conn = sqlite3.connect(
-        DB_PATH,
-        timeout=30,
-        check_same_thread=False,
-    )
+def clean_wordcloud_text(text):
 
-    # Wait up to 30 seconds if another operation is writing.
-    conn.execute("PRAGMA busy_timeout = 30000")
-
-    # WAL allows readers while another process is writing.
-    conn.execute("PRAGMA journal_mode = WAL")
-
-    # Better durability without excessive locking.
-    conn.execute("PRAGMA synchronous = NORMAL")
-
-    return conn
-
-
-def init_database():
-    """
-    Create database/tables safely.
-    """
-    with _db_lock:
-        conn = get_connection()
-
-        try:
-            cursor = conn.cursor()
-
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS reddit_posts (
-                    id TEXT PRIMARY KEY,
-                    source TEXT DEFAULT 'reddit',
-                    subreddit TEXT,
-                    author TEXT,
-                    title TEXT,
-                    text TEXT,
-                    score INTEGER DEFAULT 0,
-                    num_comments INTEGER DEFAULT 0,
-                    created_utc REAL,
-                    url TEXT,
-                    permalink TEXT,
-                    sentiment_label TEXT,
-                    sentiment_score REAL,
-                    party_mentioned TEXT,
-                    issue_mentioned TEXT,
-                    collected_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS youtube_comments (
-                    id TEXT PRIMARY KEY,
-                    source TEXT DEFAULT 'youtube',
-                    video_id TEXT,
-                    video_title TEXT,
-                    author TEXT,
-                    text TEXT,
-                    like_count INTEGER DEFAULT 0,
-                    published_at TEXT,
-                    sentiment_label TEXT,
-                    sentiment_score REAL,
-                    party_mentioned TEXT,
-                    issue_mentioned TEXT,
-                    collected_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS sentiment_summary (
-                    date TEXT PRIMARY KEY,
-                    total_posts INTEGER,
-                    positive_count INTEGER,
-                    negative_count INTEGER,
-                    neutral_count INTEGER,
-                    avg_sentiment REAL,
-                    top_positive TEXT,
-                    top_negative TEXT
-                )
-            """)
-
-            # Helpful indexes
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_reddit_sentiment
-                ON reddit_posts(sentiment_label)
-            """)
-
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_youtube_sentiment
-                ON youtube_comments(sentiment_label)
-            """)
-
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_reddit_party
-                ON reddit_posts(party_mentioned)
-            """)
-
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_youtube_party
-                ON youtube_comments(party_mentioned)
-            """)
-
-            conn.commit()
-
-        finally:
-            conn.close()
-
-
-# ============================================================
-# TEXT HELPERS
-# ============================================================
-
-def safe_text(value):
-    if value is None:
+    if not text:
         return ""
-    return str(value)
+
+    words = str(text).lower().split()
+
+    cleaned = []
+
+    for word in words:
+
+        word = word.strip(
+            ".,!?;:\"'()[]{}<>|/\\+-_=*#@"
+        )
+
+        if not word:
+            continue
+
+        if len(word) < 3:
+            continue
+
+        if word in SWEDISH_STOPWORDS:
+            continue
+
+        if word.startswith("http"):
+            continue
+
+        if "www." in word:
+            continue
+
+        cleaned.append(word)
+
+    return " ".join(cleaned)
+
+
+# ============================================================
+# PARTY DETECTION
+# ============================================================
+
+PARTY_KEYWORDS = {
+
+    "Socialdemokraterna": [
+        "socialdemokraterna",
+        "socialdemokrat",
+        "sosse",
+        "magdalena andersson",
+        "s-partiet",
+        " s "
+    ],
+
+    "Moderaterna": [
+        "moderaterna",
+        "moderat",
+        "ulf kristersson",
+        "m-partiet",
+        " moderaterna "
+    ],
+
+    "Sverigedemokraterna": [
+        "sverigedemokraterna",
+        "sverigedemokrat",
+        "sd",
+        "jimmie åkesson",
+        "jimmie akesson"
+    ],
+
+    "Kristdemokraterna": [
+        "kristdemokraterna",
+        "kristdemokrat",
+        "kd",
+        "ebba busch"
+    ],
+
+    "Liberalerna": [
+        "liberalerna",
+        "liberal",
+        "folkpartiet",
+        "johan pehrson",
+        "fp"
+    ],
+
+    "Centerpartiet": [
+        "centerpartiet",
+        "centerparti",
+        "c-partiet",
+        "muharrem demirok"
+    ],
+
+    "Miljöpartiet": [
+        "miljöpartiet",
+        "miljopartiet",
+        "miljoparti",
+        "miljöparti",
+        "mp",
+        "amanda lind"
+    ],
+
+    "Vänsterpartiet": [
+        "vänsterpartiet",
+        "vansterpartiet",
+        "vänsterparti",
+        "vansterparti",
+        "nooshi dadgostar",
+        "v-partiet"
+    ],
+}
+
+
+def detect_parties(text):
+
+    if not text:
+        return []
+
+    text_lower = " " + str(text).lower() + " "
+
+    found = []
+
+    for party, keywords in PARTY_KEYWORDS.items():
+
+        for keyword in keywords:
+
+            if keyword in text_lower:
+                found.append(party)
+                break
+
+    return found
 
 
 def detect_party(text):
-    if not text:
+
+    parties = detect_parties(text)
+
+    if not parties:
         return None
 
-    text_lower = safe_text(text).lower()
+    return ", ".join(parties)
 
-    party_keywords = {
-        "Socialdemokraterna": [
-            "socialdemokraterna",
-            "socialdemokrat",
-            "sosse",
-            "magdalena andersson",
-            "s-partiet",
-        ],
-        "Moderaterna": [
-            "moderaterna",
-            "moderat",
-            "ulf kristersson",
-            "m-partiet",
-        ],
-        "Sverigedemokraterna": [
-            "sverigedemokraterna",
-            "sverigedemokrat",
-            "jimmie akesson",
-            "jimmie åkesson",
-        ],
-        "Kristdemokraterna": [
-            "kristdemokraterna",
-            "kristdemokrat",
-            "ebba busch",
-        ],
-        "Liberalerna": [
-            "liberalerna",
-            "liberal",
-            "folkpartiet",
-            "johan pehrson",
-        ],
-        "Centerpartiet": [
-            "centerpartiet",
-            "centerparti",
-            "c-partiet",
-            "muharrem demirok",
-        ],
-        "Miljöpartiet": [
-            "miljöpartiet",
-            "miljopartiet",
-            "miljoparti",
-            "miljöparti",
-            "amanda lind",
-        ],
-        "Vänsterpartiet": [
-            "vänsterpartiet",
-            "vansterpartiet",
-            "vänsterparti",
-            "vansterparti",
-            "nooshi dadgostar",
-        ],
-    }
 
-    for party, keywords in party_keywords.items():
+# ============================================================
+# ISSUE DETECTION
+# ============================================================
+
+ISSUE_KEYWORDS = {
+
+    "Immigration": [
+        "invandring",
+        "immigration",
+        "migrant",
+        "flykting",
+        "asyl",
+        "integration"
+    ],
+
+    "Crime": [
+        "kriminalitet",
+        "brott",
+        "crime",
+        "våld",
+        "vald",
+        "skjutning",
+        "gäng",
+        "gang"
+    ],
+
+    "Healthcare": [
+        "sjukvård",
+        "sjukvard",
+        "vård",
+        "vard",
+        "healthcare",
+        "sjukhus",
+        "läkare",
+        "lakare"
+    ],
+
+    "Education": [
+        "skola",
+        "utbildning",
+        "school",
+        "lärare",
+        "larare",
+        "elever"
+    ],
+
+    "Economy": [
+        "ekonomi",
+        "economy",
+        "inflation",
+        "priser",
+        "bnp",
+        "recession"
+    ],
+
+    "Climate": [
+        "klimat",
+        "climate",
+        "miljö",
+        "miljo",
+        "koldioxid"
+    ],
+
+    "NATO": [
+        "nato",
+        "försvar",
+        "forsvar",
+        "defense",
+        "militär",
+        "militar"
+    ],
+
+    "Housing": [
+        "bostad",
+        "housing",
+        "bostäder",
+        "bostader",
+        "hyra",
+        "bostadsbrist"
+    ],
+
+    "Energy": [
+        "elpris",
+        "energi",
+        "energy",
+        "el",
+        "kärnkraft",
+        "karnkraft",
+        "vindkraft"
+    ],
+
+    "Welfare": [
+        "bidrag",
+        "welfare",
+        "försörjningsstöd",
+        "forsorjningsstod",
+        "socialbidrag",
+        "pension"
+    ]
+}
+
+
+def detect_issues(text):
+
+    if not text:
+        return []
+
+    text_lower = str(text).lower()
+
+    found = []
+
+    for issue, keywords in ISSUE_KEYWORDS.items():
+
         for keyword in keywords:
-            if keyword in text_lower:
-                return party
 
-    return None
+            if keyword in text_lower:
+                found.append(issue)
+                break
+
+    return found
 
 
 def detect_issue(text):
-    if not text:
+
+    issues = detect_issues(text)
+
+    if not issues:
         return None
 
-    text_lower = safe_text(text).lower()
+    return ", ".join(issues)
 
-    issue_keywords = {
-        "Immigration": [
-            "invandring",
-            "immigration",
-            "migrant",
-            "flykting",
-            "asyl",
-            "integration",
-        ],
-        "Crime": [
-            "kriminalitet",
-            "brott",
-            "crime",
-            "våld",
-            "vald",
-            "skjutning",
-            "gäng",
-            "gang",
-        ],
-        "Healthcare": [
-            "sjukvård",
-            "sjukvard",
-            "vård",
-            "vard",
-            "healthcare",
-            "sjukhus",
-            "läkare",
-            "lakare",
-        ],
-        "Education": [
-            "skola",
-            "utbildning",
-            "school",
-            "lärare",
-            "larare",
-            "elever",
-        ],
-        "Economy": [
-            "ekonomi",
-            "economy",
-            "inflation",
-            "priser",
-            "bnp",
-            "recession",
-        ],
-        "Climate": [
-            "klimat",
-            "climate",
-            "miljö",
-            "miljo",
-            "koldioxid",
-        ],
-        "NATO": [
-            "nato",
-            "försvar",
-            "forsvar",
-            "defense",
-            "militär",
-            "militar",
-        ],
-        "Housing": [
-            "bostad",
-            "housing",
-            "bostäder",
-            "bostader",
-            "hyra",
-            "bostadsbrist",
-        ],
-        "Energy": [
-            "elpris",
-            "energi",
-            "energy",
-            "kärnkraft",
-            "karnkraft",
-            "vindkraft",
-        ],
-        "Welfare": [
-            "bidrag",
-            "welfare",
-            "försörjningsstöd",
-            "forsorjningsstod",
-            "socialbidrag",
-            "pension",
-        ],
-    }
 
-    for issue, keywords in issue_keywords.items():
-        for keyword in keywords:
-            if keyword in text_lower:
-                return issue
+# ============================================================
+# REDDIT COLLECTION
+# ============================================================
 
-    return None
+def collect_reddit(limit=300):
+
+    if not REDDIT_CLIENT_ID or not REDDIT_CLIENT_SECRET:
+
+        return 0, 0, (
+            "ERROR: Reddit API credentials are not configured. "
+            "Add REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET to Streamlit Secrets."
+        )
+
+    try:
+
+        reddit = praw.Reddit(
+            client_id=REDDIT_CLIENT_ID,
+            client_secret=REDDIT_CLIENT_SECRET,
+            user_agent="SwedishElectionMonitor/1.0"
+        )
+
+    except Exception as e:
+
+        return 0, 0, f"ERROR: Reddit authentication failed: {e}"
+
+
+    def _collect():
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        new_count = 0
+        existing_count = 0
+
+        limit_per_term = max(
+            1,
+            limit // max(1, len(SEARCH_TERMS))
+        )
+
+        for subreddit_name in SUBREDDITS:
+
+            try:
+                subreddit = reddit.subreddit(subreddit_name)
+
+            except Exception:
+                continue
+
+            for term in SEARCH_TERMS:
+
+                try:
+
+                    posts = subreddit.search(
+                        term,
+                        limit=limit_per_term,
+                        sort="new"
+                    )
+
+                    for post in posts:
+
+                        title = post.title or ""
+                        body = post.selftext or ""
+
+                        full_text = f"{title} {body}"
+
+                        parties = detect_party(full_text)
+                        issues = detect_issue(full_text)
+
+                        cursor.execute(
+                            "SELECT 1 FROM reddit_posts WHERE id = ?",
+                            (post.id,)
+                        )
+
+                        exists = cursor.fetchone()
+
+                        if exists:
+
+                            existing_count += 1
+                            continue
+
+                        cursor.execute(
+                            """
+                            INSERT INTO reddit_posts
+                            (
+                                id,
+                                subreddit,
+                                author,
+                                title,
+                                text,
+                                score,
+                                num_comments,
+                                created_utc,
+                                url,
+                                permalink,
+                                party_mentioned,
+                                issue_mentioned
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                post.id,
+                                subreddit_name,
+                                str(post.author) if post.author else "",
+                                title,
+                                body,
+                                post.score,
+                                post.num_comments,
+                                post.created_utc,
+                                post.url,
+                                post.permalink,
+                                parties,
+                                issues
+                            )
+                        )
+
+                        new_count += 1
+
+                except Exception:
+                    continue
+
+        conn.commit()
+        conn.close()
+
+        return new_count, existing_count
+
+    try:
+
+        new_count, existing_count = execute_with_retry(_collect)
+
+        return (
+            new_count,
+            existing_count,
+            f"Reddit: {new_count} new posts, "
+            f"{existing_count} already stored."
+        )
+
+    except Exception as e:
+
+        return 0, 0, f"ERROR collecting Reddit: {e}"
+
+
+# ============================================================
+# YOUTUBE COLLECTION
+# ============================================================
+
+def collect_youtube(max_results=30):
+
+    if not YOUTUBE_API_KEY:
+
+        return 0, 0, (
+            "ERROR: YouTube API key is not configured. "
+            "Add YOUTUBE_API_KEY to Streamlit Secrets."
+        )
+
+    try:
+
+        youtube = build(
+            "youtube",
+            "v3",
+            developerKey=YOUTUBE_API_KEY
+        )
+
+    except Exception as e:
+
+        return 0, 0, f"ERROR: YouTube API initialization failed: {e}"
+
+
+    def _collect():
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        new_count = 0
+        existing_count = 0
+
+        for query in YOUTUBE_QUERIES:
+
+            try:
+
+                search_response = (
+                    youtube.search()
+                    .list(
+                        q=query,
+                        part="id,snippet",
+                        maxResults=max_results,
+                        type="video",
+                        order="relevance"
+                    )
+                    .execute()
+                )
+
+            except Exception:
+                continue
+
+
+            for video in search_response.get("items", []):
+
+                try:
+
+                    video_id = video["id"]["videoId"]
+                    video_title = video["snippet"]["title"]
+
+                except Exception:
+                    continue
+
+
+                try:
+
+                    comments_response = (
+                        youtube.commentThreads()
+                        .list(
+                            part="snippet",
+                            videoId=video_id,
+                            maxResults=50,
+                            order="relevance"
+                        )
+                        .execute()
+                    )
+
+                except Exception:
+                    continue
+
+
+                for item in comments_response.get("items", []):
+
+                    try:
+
+                        comment = (
+                            item["snippet"]
+                            ["topLevelComment"]
+                            ["snippet"]
+                        )
+
+                        comment_id = item["id"]
+
+                        cursor.execute(
+                            "SELECT 1 FROM youtube_comments WHERE id = ?",
+                            (comment_id,)
+                        )
+
+                        exists = cursor.fetchone()
+
+                        if exists:
+
+                            existing_count += 1
+                            continue
+
+
+                        text = comment.get("textDisplay", "")
+
+                        parties = detect_party(text)
+                        issues = detect_issue(text)
+
+                        cursor.execute(
+                            """
+                            INSERT INTO youtube_comments
+                            (
+                                id,
+                                video_id,
+                                video_title,
+                                author,
+                                text,
+                                like_count,
+                                published_at,
+                                party_mentioned,
+                                issue_mentioned
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                comment_id,
+                                video_id,
+                                video_title,
+                                comment.get(
+                                    "authorDisplayName",
+                                    ""
+                                ),
+                                text,
+                                comment.get(
+                                    "likeCount",
+                                    0
+                                ),
+                                comment.get(
+                                    "publishedAt",
+                                    ""
+                                ),
+                                parties,
+                                issues
+                            )
+                        )
+
+                        new_count += 1
+
+                    except Exception:
+                        continue
+
+
+        conn.commit()
+        conn.close()
+
+        return new_count, existing_count
+
+
+    try:
+
+        new_count, existing_count = execute_with_retry(_collect)
+
+        return (
+            new_count,
+            existing_count,
+            f"YouTube: {new_count} new comments, "
+            f"{existing_count} already stored."
+        )
+
+    except Exception as e:
+
+        return 0, 0, f"ERROR collecting YouTube: {e}"
 
 
 # ============================================================
@@ -459,530 +895,210 @@ def detect_issue(text):
 
 @st.cache_resource(show_spinner=False)
 def load_sentiment_model():
-    """
-    Load a multilingual DistilBERT model.
 
-    This deliberately replaces the broken CardiffNLP
-    XLM-RoBERTa model that was producing the
-    sentencepiece.bpe.model parsing error.
-    """
-    from transformers import pipeline
-
-    classifier = pipeline(
-        "text-classification",
-        model=SENTIMENT_MODEL,
-        tokenizer=SENTIMENT_MODEL,
-        device=-1,
+    return pipeline(
+        "sentiment-analysis",
+        model="cardiffnlp/twitter-xlm-roberta-base-sentiment"
     )
 
-    return classifier
 
+def normalize_sentiment(result, classifier):
 
-def normalize_sentiment(result):
-    """
-    Convert model output into:
-        positive
-        negative
-        neutral
+    label = str(result["label"]).lower()
+    score = float(result["score"])
 
-    Returns:
-        label, score
-    """
+    # Handle models that expose LABEL_0 etc.
+    try:
 
-    label = safe_text(result.get("label")).lower()
-    score = float(result.get("score", 0.0))
+        id2label = classifier.model.config.id2label
+
+        label_id = None
+
+        if label.startswith("label_"):
+            label_id = int(label.split("_")[-1])
+
+        if label_id is not None and label_id in id2label:
+
+            label = str(
+                id2label[label_id]
+            ).lower()
+
+    except Exception:
+        pass
+
 
     if "positive" in label:
-        return "positive", abs(score)
+
+        return "positive", score
 
     if "negative" in label:
-        return "negative", -abs(score)
+
+        return "negative", -score
 
     return "neutral", 0.0
 
 
 # ============================================================
-# DATABASE INSERT HELPERS
-# ============================================================
-
-def insert_reddit_rows(rows):
-    if not rows:
-        return 0
-
-    with _db_lock:
-        conn = get_connection()
-
-        try:
-            conn.executemany(
-                """
-                INSERT OR IGNORE INTO reddit_posts
-                (
-                    id,
-                    subreddit,
-                    author,
-                    title,
-                    text,
-                    score,
-                    num_comments,
-                    created_utc,
-                    url,
-                    permalink,
-                    party_mentioned,
-                    issue_mentioned
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                rows,
-            )
-
-            conn.commit()
-            return len(rows)
-
-        finally:
-            conn.close()
-
-
-def insert_youtube_rows(rows):
-    if not rows:
-        return 0
-
-    with _db_lock:
-        conn = get_connection()
-
-        try:
-            conn.executemany(
-                """
-                INSERT OR IGNORE INTO youtube_comments
-                (
-                    id,
-                    video_id,
-                    video_title,
-                    author,
-                    text,
-                    like_count,
-                    published_at,
-                    party_mentioned,
-                    issue_mentioned
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                rows,
-            )
-
-            conn.commit()
-            return len(rows)
-
-        finally:
-            conn.close()
-
-
-# ============================================================
-# REDDIT COLLECTOR
-# ============================================================
-
-def collect_reddit(limit=150):
-    if not REDDIT_CLIENT_ID or not REDDIT_CLIENT_SECRET:
-        return (
-            0,
-            "Reddit credentials are not configured. "
-            "Add REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET to Streamlit Secrets.",
-        )
-
-    try:
-        import praw
-    except ImportError:
-        return (
-            0,
-            "PRAW is missing. Add praw to requirements.txt and redeploy.",
-        )
-
-    try:
-        reddit = praw.Reddit(
-            client_id=REDDIT_CLIENT_ID,
-            client_secret=REDDIT_CLIENT_SECRET,
-            user_agent="SwedishElectionMonitor/1.0",
-        )
-
-        # Test credentials.
-        reddit.user.me
-
-    except Exception as e:
-        return 0, f"Reddit authentication failed: {e}"
-
-    rows = []
-
-    per_term = max(
-        1,
-        min(10, limit // max(1, len(SEARCH_TERMS))),
-    )
-
-    for subreddit_name in SUBREDDITS:
-        for term in SEARCH_TERMS:
-
-            try:
-                subreddit = reddit.subreddit(subreddit_name)
-
-                for post in subreddit.search(
-                    term,
-                    limit=per_term,
-                    sort="new",
-                ):
-                    title = safe_text(post.title)
-                    body = safe_text(post.selftext)
-                    combined = f"{title} {body}"
-
-                    party = detect_party(combined)
-                    issue = detect_issue(combined)
-
-                    rows.append(
-                        (
-                            safe_text(post.id),
-                            subreddit_name,
-                            safe_text(post.author),
-                            title,
-                            body,
-                            int(post.score or 0),
-                            int(post.num_comments or 0),
-                            float(post.created_utc or 0),
-                            safe_text(post.url),
-                            safe_text(post.permalink),
-                            party,
-                            issue,
-                        )
-                    )
-
-            except Exception:
-                continue
-
-    inserted = insert_reddit_rows(rows)
-
-    return (
-        inserted,
-        f"Collected {inserted} Reddit posts.",
-    )
-
-
-# ============================================================
-# YOUTUBE COLLECTOR
-# ============================================================
-
-def collect_youtube(max_results=20):
-    if not YOUTUBE_API_KEY:
-        return (
-            0,
-            "YouTube API key is not configured. "
-            "Add YOUTUBE_API_KEY to Streamlit Secrets.",
-        )
-
-    try:
-        from googleapiclient.discovery import build
-    except ImportError:
-        return (
-            0,
-            "Google API package is missing. "
-            "Add google-api-python-client to requirements.txt.",
-        )
-
-    try:
-        youtube = build(
-            "youtube",
-            "v3",
-            developerKey=YOUTUBE_API_KEY,
-        )
-    except Exception as e:
-        return 0, f"YouTube API initialization failed: {e}"
-
-    rows = []
-
-    for query in YOUTUBE_QUERIES:
-
-        try:
-            search_response = (
-                youtube.search()
-                .list(
-                    q=query,
-                    part="id,snippet",
-                    maxResults=max_results,
-                    type="video",
-                    order="relevance",
-                )
-                .execute()
-            )
-
-            for video in search_response.get("items", []):
-
-                video_id = (
-                    video.get("id", {})
-                    .get("videoId")
-                )
-
-                if not video_id:
-                    continue
-
-                snippet = video.get("snippet", {})
-
-                video_title = safe_text(
-                    snippet.get("title")
-                )
-
-                try:
-                    comments_response = (
-                        youtube.commentThreads()
-                        .list(
-                            part="snippet",
-                            videoId=video_id,
-                            maxResults=50,
-                            order="relevance",
-                        )
-                        .execute()
-                    )
-
-                    for item in comments_response.get(
-                        "items",
-                        [],
-                    ):
-
-                        comment_data = (
-                            item
-                            .get("snippet", {})
-                            .get("topLevelComment", {})
-                            .get("snippet", {})
-                        )
-
-                        text = safe_text(
-                            comment_data.get(
-                                "textDisplay"
-                            )
-                        )
-
-                        comment_id = safe_text(
-                            item.get("id")
-                        )
-
-                        party = detect_party(text)
-                        issue = detect_issue(text)
-
-                        rows.append(
-                            (
-                                comment_id,
-                                video_id,
-                                video_title,
-                                safe_text(
-                                    comment_data.get(
-                                        "authorDisplayName"
-                                    )
-                                ),
-                                text,
-                                int(
-                                    comment_data.get(
-                                        "likeCount",
-                                        0,
-                                    )
-                                    or 0
-                                ),
-                                safe_text(
-                                    comment_data.get(
-                                        "publishedAt"
-                                    )
-                                ),
-                                party,
-                                issue,
-                            )
-                        )
-
-                except Exception:
-                    continue
-
-        except Exception:
-            continue
-
-    inserted = insert_youtube_rows(rows)
-
-    return (
-        inserted,
-        f"Collected {inserted} YouTube comments.",
-    )
-
-
-# ============================================================
-# SENTIMENT ANALYSIS
+# ANALYZE DATABASE
 # ============================================================
 
 def analyze_database():
-    """
-    Analyze all currently unprocessed posts.
-
-    IMPORTANT:
-    We do NOT hold an SQLite connection open while the AI
-    model is running. This is one of the fixes for
-    'database is locked'.
-    """
-
-    # --------------------------------------------------------
-    # Load model BEFORE opening SQLite.
-    # --------------------------------------------------------
 
     try:
+
         classifier = load_sentiment_model()
+
     except Exception as e:
+
+        return 0, f"Could not load sentiment model: {e}"
+
+
+    def _analyze():
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        analyzed_count = 0
+
+
+        # ----------------------------------------------------
+        # REDDIT
+        # ----------------------------------------------------
+
+        cursor.execute(
+            """
+            SELECT id, title, text
+            FROM reddit_posts
+            WHERE sentiment_label IS NULL
+            """
+        )
+
+        reddit_posts = cursor.fetchall()
+
+
+        for post_id, title, text in reddit_posts:
+
+            full_text = f"{title or ''} {text or ''}".strip()
+
+            if not full_text:
+
+                label = "neutral"
+                score = 0.0
+
+            else:
+
+                try:
+
+                    result = classifier(
+                        full_text[:512]
+                    )[0]
+
+                    label, score = normalize_sentiment(
+                        result,
+                        classifier
+                    )
+
+                except Exception:
+
+                    label = "neutral"
+                    score = 0.0
+
+
+            cursor.execute(
+                """
+                UPDATE reddit_posts
+                SET sentiment_label = ?,
+                    sentiment_score = ?
+                WHERE id = ?
+                """,
+                (
+                    label,
+                    score,
+                    post_id
+                )
+            )
+
+            analyzed_count += 1
+
+
+        # ----------------------------------------------------
+        # YOUTUBE
+        # ----------------------------------------------------
+
+        cursor.execute(
+            """
+            SELECT id, text
+            FROM youtube_comments
+            WHERE sentiment_label IS NULL
+            """
+        )
+
+        youtube_comments = cursor.fetchall()
+
+
+        for comment_id, text in youtube_comments:
+
+            text = text or ""
+
+            if not text.strip():
+
+                label = "neutral"
+                score = 0.0
+
+            else:
+
+                try:
+
+                    result = classifier(
+                        text[:512]
+                    )[0]
+
+                    label, score = normalize_sentiment(
+                        result,
+                        classifier
+                    )
+
+                except Exception:
+
+                    label = "neutral"
+                    score = 0.0
+
+
+            cursor.execute(
+                """
+                UPDATE youtube_comments
+                SET sentiment_label = ?,
+                    sentiment_score = ?
+                WHERE id = ?
+                """,
+                (
+                    label,
+                    score,
+                    comment_id
+                )
+            )
+
+            analyzed_count += 1
+
+
+        conn.commit()
+        conn.close()
+
+        return analyzed_count
+
+
+    try:
+
+        count = execute_with_retry(_analyze)
+
         return (
-            0,
-            f"Could not load sentiment model: {e}",
+            count,
+            f"Successfully analyzed {count} new items."
         )
 
-    # --------------------------------------------------------
-    # Read unprocessed data.
-    # --------------------------------------------------------
+    except Exception as e:
 
-    with _db_lock:
-        conn = get_connection()
-
-        try:
-            reddit_rows = conn.execute(
-                """
-                SELECT id, title, text
-                FROM reddit_posts
-                WHERE sentiment_label IS NULL
-                """
-            ).fetchall()
-
-            youtube_rows = conn.execute(
-                """
-                SELECT id, text
-                FROM youtube_comments
-                WHERE sentiment_label IS NULL
-                """
-            ).fetchall()
-
-        finally:
-            conn.close()
-
-    analyzed_count = 0
-
-    # --------------------------------------------------------
-    # Analyze Reddit
-    # --------------------------------------------------------
-
-    reddit_updates = []
-
-    for post_id, title, text in reddit_rows:
-
-        combined = (
-            f"{safe_text(title)} {safe_text(text)}"
-        ).strip()
-
-        if not combined:
-            label = "neutral"
-            score = 0.0
-
-        else:
-            try:
-                result = classifier(
-                    combined[:512],
-                    truncation=True,
-                    max_length=512,
-                )[0]
-
-                label, score = normalize_sentiment(
-                    result
-                )
-
-            except Exception:
-                label = "neutral"
-                score = 0.0
-
-        reddit_updates.append(
-            (
-                label,
-                score,
-                post_id,
-            )
-        )
-
-    # --------------------------------------------------------
-    # Analyze YouTube
-    # --------------------------------------------------------
-
-    youtube_updates = []
-
-    for comment_id, text in youtube_rows:
-
-        text = safe_text(text).strip()
-
-        if not text:
-            label = "neutral"
-            score = 0.0
-
-        else:
-            try:
-                result = classifier(
-                    text[:512],
-                    truncation=True,
-                    max_length=512,
-                )[0]
-
-                label, score = normalize_sentiment(
-                    result
-                )
-
-            except Exception:
-                label = "neutral"
-                score = 0.0
-
-        youtube_updates.append(
-            (
-                label,
-                score,
-                comment_id,
-            )
-        )
-
-    # --------------------------------------------------------
-    # WRITE RESULTS IN SHORT TRANSACTIONS
-    # --------------------------------------------------------
-
-    with _db_lock:
-
-        conn = get_connection()
-
-        try:
-
-            if reddit_updates:
-                conn.executemany(
-                    """
-                    UPDATE reddit_posts
-                    SET sentiment_label = ?,
-                        sentiment_score = ?
-                    WHERE id = ?
-                    """,
-                    reddit_updates,
-                )
-
-            if youtube_updates:
-                conn.executemany(
-                    """
-                    UPDATE youtube_comments
-                    SET sentiment_label = ?,
-                        sentiment_score = ?
-                    WHERE id = ?
-                    """,
-                    youtube_updates,
-                )
-
-            conn.commit()
-
-            analyzed_count = (
-                len(reddit_updates)
-                + len(youtube_updates)
-            )
-
-        finally:
-            conn.close()
-
-    return (
-        analyzed_count,
-        "Sentiment analysis completed.",
-    )
+        return 0, f"ERROR during sentiment analysis: {e}"
 
 
 # ============================================================
@@ -990,179 +1106,171 @@ def analyze_database():
 # ============================================================
 
 def generate_summary():
-    with _db_lock:
+
+    def _generate():
 
         conn = get_connection()
 
-        try:
-            query = """
-                SELECT
-                    sentiment_label,
-                    sentiment_score,
-                    text,
-                    party_mentioned,
-                    issue_mentioned
-                FROM reddit_posts
-                WHERE sentiment_label IS NOT NULL
+        query = """
+            SELECT
+                sentiment_label,
+                sentiment_score,
+                text,
+                party_mentioned,
+                issue_mentioned,
+                'Reddit' AS source
+            FROM reddit_posts
+            WHERE sentiment_label IS NOT NULL
 
-                UNION ALL
+            UNION ALL
 
-                SELECT
-                    sentiment_label,
-                    sentiment_score,
-                    text,
-                    party_mentioned,
-                    issue_mentioned
-                FROM youtube_comments
-                WHERE sentiment_label IS NOT NULL
-            """
+            SELECT
+                sentiment_label,
+                sentiment_score,
+                text,
+                party_mentioned,
+                issue_mentioned,
+                'YouTube' AS source
+            FROM youtube_comments
+            WHERE sentiment_label IS NOT NULL
+        """
 
-            df = pd.read_sql_query(
-                query,
-                conn,
-            )
+        df = pd.read_sql_query(
+            query,
+            conn
+        )
 
-        finally:
-            conn.close()
+        conn.close()
 
-    if df.empty:
-        return None
+        if len(df) == 0:
+            return None
 
-    positive = (
-        df["sentiment_label"]
-        .eq("positive")
-        .sum()
-    )
 
-    negative = (
-        df["sentiment_label"]
-        .eq("negative")
-        .sum()
-    )
+        summary = {
 
-    neutral = (
-        df["sentiment_label"]
-        .eq("neutral")
-        .sum()
-    )
+            "date":
+                datetime.now().strftime("%Y-%m-%d"),
 
-    avg_sentiment = float(
-        df["sentiment_score"]
-        .fillna(0)
-        .mean()
-    )
+            "total_posts":
+                len(df),
 
-    summary = {
-        "date": datetime.now(
-            timezone.utc
-        ).strftime("%Y-%m-%d"),
-
-        "total_posts": len(df),
-
-        "positive_count": int(
-            positive
-        ),
-
-        "negative_count": int(
-            negative
-        ),
-
-        "neutral_count": int(
-            neutral
-        ),
-
-        "avg_sentiment": avg_sentiment,
-    }
-
-    with _db_lock:
-
-        conn = get_connection()
-
-        try:
-
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO sentiment_summary
-                (
-                    date,
-                    total_posts,
-                    positive_count,
-                    negative_count,
-                    neutral_count,
-                    avg_sentiment,
-                    top_positive,
-                    top_negative
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    summary["date"],
-                    summary["total_posts"],
-                    summary["positive_count"],
-                    summary["negative_count"],
-                    summary["neutral_count"],
-                    summary["avg_sentiment"],
-                    "N/A",
-                    "N/A",
+            "positive_count":
+                len(
+                    df[
+                        df["sentiment_label"]
+                        == "positive"
+                    ]
                 ),
+
+            "negative_count":
+                len(
+                    df[
+                        df["sentiment_label"]
+                        == "negative"
+                    ]
+                ),
+
+            "neutral_count":
+                len(
+                    df[
+                        df["sentiment_label"]
+                        == "neutral"
+                    ]
+                ),
+
+            "avg_sentiment":
+                df["sentiment_score"].mean()
+        }
+
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO sentiment_summary
+            (
+                date,
+                total_posts,
+                positive_count,
+                negative_count,
+                neutral_count,
+                avg_sentiment,
+                top_positive,
+                top_negative
             )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                summary["date"],
+                summary["total_posts"],
+                summary["positive_count"],
+                summary["negative_count"],
+                summary["neutral_count"],
+                summary["avg_sentiment"],
+                "N/A",
+                "N/A"
+            )
+        )
 
-            conn.commit()
 
-        finally:
-            conn.close()
+        conn.commit()
+        conn.close()
 
-    return summary
+        return summary
+
+
+    return execute_with_retry(_generate)
 
 
 # ============================================================
-# LOAD DASHBOARD DATA
+# DASHBOARD DATA
 # ============================================================
 
 def load_dashboard_data():
 
-    with _db_lock:
+    def _load():
 
         conn = get_connection()
 
-        try:
+        reddit_df = pd.read_sql_query(
+            """
+            SELECT *
+            FROM reddit_posts
+            WHERE sentiment_label IS NOT NULL
+            """,
+            conn
+        )
 
-            reddit_df = pd.read_sql_query(
-                """
-                SELECT *
-                FROM reddit_posts
-                WHERE sentiment_label IS NOT NULL
-                """,
-                conn,
-            )
+        youtube_df = pd.read_sql_query(
+            """
+            SELECT *
+            FROM youtube_comments
+            WHERE sentiment_label IS NOT NULL
+            """,
+            conn
+        )
 
-            youtube_df = pd.read_sql_query(
-                """
-                SELECT *
-                FROM youtube_comments
-                WHERE sentiment_label IS NOT NULL
-                """,
-                conn,
-            )
+        summary_df = pd.read_sql_query(
+            """
+            SELECT *
+            FROM sentiment_summary
+            ORDER BY date DESC
+            LIMIT 30
+            """,
+            conn
+        )
 
-            summary_df = pd.read_sql_query(
-                """
-                SELECT *
-                FROM sentiment_summary
-                ORDER BY date DESC
-                LIMIT 30
-                """,
-                conn,
-            )
+        conn.close()
 
-        finally:
-            conn.close()
+        return (
+            reddit_df,
+            youtube_df,
+            summary_df
+        )
 
-    return (
-        reddit_df,
-        youtube_df,
-        summary_df,
-    )
+    return execute_with_retry(_load)
 
 
 # ============================================================
@@ -1175,24 +1283,16 @@ def show_dashboard():
         "🇸🇪 Swedish Election Sentiment Monitor 2026"
     )
 
-    election_date = datetime(
-        2026,
-        9,
-        13,
-    )
 
-    now = datetime.now()
+    election_date = datetime(2026, 9, 13)
 
-    days_until = max(
-        0,
-        (election_date - now).days,
-    )
+    days_until = (
+        election_date - datetime.now()
+    ).days
 
     st.markdown(
-        f"""
-        **Riksdagsval: September 13, 2026**
-        | **{days_until} days until election**
-        """
+        f"**Riksdagsval: September 13, 2026** "
+        f"| {days_until} days until election"
     )
 
     st.markdown(
@@ -1200,17 +1300,20 @@ def show_dashboard():
         "for the Swedish general election."
     )
 
+
     # ========================================================
     # SIDEBAR
     # ========================================================
 
     with st.sidebar:
 
-        st.header("🎛️ Controls")
+        st.title("🎛️ Controls")
 
         st.caption(
-            f"AI model: `{SENTIMENT_MODEL}`"
+            "Manual mode — data is collected only when "
+            "you press the button."
         )
+
 
         # ----------------------------------------------------
         # COLLECT
@@ -1218,31 +1321,34 @@ def show_dashboard():
 
         if st.button(
             "🔄 Collect New Data",
-            use_container_width=True,
+            use_container_width=True
         ):
 
             with st.spinner(
-                "Collecting Reddit and YouTube data..."
+                "Collecting new Reddit and YouTube data..."
             ):
 
-                reddit_count, reddit_msg = (
+                reddit_new, reddit_existing, reddit_msg = (
                     collect_reddit()
                 )
 
-                youtube_count, youtube_msg = (
+                youtube_new, youtube_existing, youtube_msg = (
                     collect_youtube()
                 )
 
-            st.success(
-                f"Reddit: {reddit_count}"
-            )
 
             st.success(
-                f"YouTube: {youtube_count}"
+                "Collection complete."
             )
 
-            st.caption(reddit_msg)
-            st.caption(youtube_msg)
+            st.write(reddit_msg)
+            st.write(youtube_msg)
+
+            st.info(
+                f"🆕 Total new items: "
+                f"{reddit_new + youtube_new}"
+            )
+
 
         # ----------------------------------------------------
         # ANALYZE
@@ -1250,26 +1356,43 @@ def show_dashboard():
 
         if st.button(
             "🧠 Analyze Sentiment",
-            use_container_width=True,
+            use_container_width=True
         ):
 
             with st.spinner(
-                "Loading AI model and analyzing posts..."
+                "Running XLM-R sentiment analysis..."
             ):
 
                 analyzed, message = (
                     analyze_database()
                 )
 
+                if analyzed > 0:
+
+                    try:
+                        generate_summary()
+                    except Exception:
+                        pass
+
+
             if analyzed > 0:
-                generate_summary()
 
                 st.success(
-                    f"Analyzed {analyzed} items."
+                    f"Analyzed {analyzed} new items."
                 )
 
             else:
-                st.warning(message)
+
+                if message.startswith("ERROR"):
+
+                    st.error(message)
+
+                else:
+
+                    st.info(
+                        "No unanalyzed items found."
+                    )
+
 
         # ----------------------------------------------------
         # REFRESH
@@ -1277,19 +1400,89 @@ def show_dashboard():
 
         if st.button(
             "📊 Refresh Dashboard",
-            use_container_width=True,
+            use_container_width=True
         ):
+
             st.rerun()
 
-        st.divider()
 
-        st.subheader("🇸🇪 Party Reference")
+        st.markdown("---")
+
+
+        # ----------------------------------------------------
+        # DATABASE STATUS
+        # ----------------------------------------------------
+
+        st.subheader("📦 Database Status")
+
+        try:
+
+            conn = get_connection()
+
+            reddit_total = conn.execute(
+                "SELECT COUNT(*) FROM reddit_posts"
+            ).fetchone()[0]
+
+            youtube_total = conn.execute(
+                "SELECT COUNT(*) FROM youtube_comments"
+            ).fetchone()[0]
+
+            reddit_unanalyzed = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM reddit_posts
+                WHERE sentiment_label IS NULL
+                """
+            ).fetchone()[0]
+
+            youtube_unanalyzed = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM youtube_comments
+                WHERE sentiment_label IS NULL
+                """
+            ).fetchone()[0]
+
+            conn.close()
+
+
+            st.metric(
+                "Reddit items",
+                reddit_total
+            )
+
+            st.metric(
+                "YouTube comments",
+                youtube_total
+            )
+
+            st.caption(
+                f"Unanalyzed: "
+                f"{reddit_unanalyzed + youtube_unanalyzed}"
+            )
+
+        except Exception as e:
+
+            st.warning(
+                f"Database status unavailable: {e}"
+            )
+
+
+        st.markdown("---")
+
+
+        # ----------------------------------------------------
+        # PARTY REFERENCE
+        # ----------------------------------------------------
+
+        st.subheader("Party Reference")
 
         for party, info in SWEDISH_PARTIES.items():
 
             st.markdown(
-                f"**{info['abbrev']}** — {party}"
+                f"**{info['abbrev']}** - {party}"
             )
+
 
     # ========================================================
     # LOAD DATA
@@ -1300,199 +1493,160 @@ def show_dashboard():
         (
             reddit_df,
             youtube_df,
-            summary_df,
+            summary_df
         ) = load_dashboard_data()
 
-    except sqlite3.OperationalError as e:
+    except Exception as e:
 
         st.error(
-            f"Database error: {e}"
-        )
-
-        st.info(
-            "If the database is temporarily busy, "
-            "wait a few seconds and click Refresh Dashboard."
+            f"Could not read database: {e}"
         )
 
         return
+
 
     # ========================================================
     # PREPARE DATA
     # ========================================================
 
-    if not reddit_df.empty:
+    reddit_df["source"] = "Reddit"
+    youtube_df["source"] = "YouTube"
 
-        reddit_df["source"] = "Reddit"
+
+    if len(reddit_df) > 0:
 
         reddit_df["text"] = (
-            reddit_df["title"]
-            .fillna("")
-            .astype(str)
+            reddit_df["title"].fillna("")
             + " "
-            + reddit_df["text"]
-            .fillna("")
-            .astype(str)
+            + reddit_df["text"].fillna("")
         )
 
-    else:
 
-        reddit_df = pd.DataFrame(
-            columns=[
-                "source",
-                "text",
-                "sentiment_label",
-                "sentiment_score",
-                "collected_at",
-                "party_mentioned",
-                "issue_mentioned",
-            ]
-        )
+    required_columns = [
+        "source",
+        "text",
+        "sentiment_label",
+        "sentiment_score",
+        "collected_at",
+        "party_mentioned",
+        "issue_mentioned"
+    ]
 
-    if not youtube_df.empty:
-
-        youtube_df["source"] = "YouTube"
-
-    else:
-
-        youtube_df = pd.DataFrame(
-            columns=[
-                "source",
-                "text",
-                "sentiment_label",
-                "sentiment_score",
-                "collected_at",
-                "party_mentioned",
-                "issue_mentioned",
-            ]
-        )
 
     all_data = pd.concat(
         [
-            reddit_df[
-                [
-                    "source",
-                    "text",
-                    "sentiment_label",
-                    "sentiment_score",
-                    "collected_at",
-                    "party_mentioned",
-                    "issue_mentioned",
-                ]
-            ],
-            youtube_df[
-                [
-                    "source",
-                    "text",
-                    "sentiment_label",
-                    "sentiment_score",
-                    "collected_at",
-                    "party_mentioned",
-                    "issue_mentioned",
-                ]
-            ],
+            reddit_df[required_columns],
+            youtube_df[required_columns]
         ],
-        ignore_index=True,
+        ignore_index=True
     )
+
 
     # ========================================================
     # EMPTY STATE
     # ========================================================
 
-    if all_data.empty:
+    if len(all_data) == 0:
 
         st.info(
-            """
-            No analyzed data yet.
-
-            1. Add your API keys to Streamlit Secrets.
-            2. Click **Collect New Data**.
-            3. Click **Analyze Sentiment**.
-            """
+            "No analyzed data yet. "
+            "Press 'Collect New Data', then "
+            "'Analyze Sentiment'."
         )
 
         return
+
 
     # ========================================================
     # TOP METRICS
     # ========================================================
 
-    total = len(all_data)
+    col1, col2, col3, col4, col5 = st.columns(5)
 
-    positive_count = (
-        all_data["sentiment_label"]
-        .eq("positive")
-        .sum()
-    )
-
-    negative_count = (
-        all_data["sentiment_label"]
-        .eq("negative")
-        .sum()
-    )
-
-    positive_pct = (
-        positive_count / total * 100
-        if total
-        else 0
-    )
-
-    negative_pct = (
-        negative_count / total * 100
-        if total
-        else 0
-    )
-
-    avg_score = (
-        all_data["sentiment_score"]
-        .fillna(0)
-        .mean()
-    )
-
-    party_mentions = (
-        all_data["party_mentioned"]
-        .notna()
-        .sum()
-    )
-
-    col1, col2, col3, col4, col5 = (
-        st.columns(5)
-    )
 
     with col1:
+
         st.metric(
             "Total Posts",
-            total,
+            len(all_data)
         )
+
 
     with col2:
+
+        positive_count = len(
+            all_data[
+                all_data["sentiment_label"]
+                == "positive"
+            ]
+        )
+
+        pos_pct = (
+            positive_count
+            / len(all_data)
+            * 100
+        )
+
         st.metric(
             "Positive %",
-            f"{positive_pct:.1f}%",
+            f"{pos_pct:.1f}%"
         )
+
 
     with col3:
+
+        negative_count = len(
+            all_data[
+                all_data["sentiment_label"]
+                == "negative"
+            ]
+        )
+
+        neg_pct = (
+            negative_count
+            / len(all_data)
+            * 100
+        )
+
         st.metric(
             "Negative %",
-            f"{negative_pct:.1f}%",
+            f"{neg_pct:.1f}%"
         )
+
 
     with col4:
-        st.metric(
-            "Avg Sentiment",
-            f"{avg_score:.3f}",
+
+        avg_score = (
+            all_data["sentiment_score"]
+            .mean()
         )
 
-    with col5:
         st.metric(
-            "Party Mentions",
-            int(party_mentions),
+            "Avg Sentiment",
+            f"{avg_score:.3f}"
         )
+
+
+    with col5:
+
+        party_mentions = (
+            all_data["party_mentioned"]
+            .notna()
+            .sum()
+        )
+
+        st.metric(
+            "Political Mentions",
+            party_mentions
+        )
+
 
     # ========================================================
     # SENTIMENT DISTRIBUTION
     # ========================================================
 
     col_left, col_right = st.columns(2)
+
 
     with col_left:
 
@@ -1505,16 +1659,27 @@ def show_dashboard():
             .value_counts()
         )
 
+
         fig = px.pie(
             values=sentiment_counts.values,
             names=sentiment_counts.index,
-            title="Overall sentiment",
+            color=sentiment_counts.index,
+            color_discrete_map={
+                "positive": "#2ecc71",
+                "negative": "#e74c3c",
+                "neutral": "#95a5a6"
+            }
         )
 
         st.plotly_chart(
             fig,
-            use_container_width=True,
+            use_container_width=True
         )
+
+
+    # ========================================================
+    # SENTIMENT BY SOURCE
+    # ========================================================
 
     with col_right:
 
@@ -1527,7 +1692,7 @@ def show_dashboard():
             .groupby(
                 [
                     "source",
-                    "sentiment_label",
+                    "sentiment_label"
                 ]
             )
             .size()
@@ -1536,26 +1701,33 @@ def show_dashboard():
             )
         )
 
+
         fig = px.bar(
             source_sentiment,
             x="source",
             y="count",
             color="sentiment_label",
-            barmode="group",
+            color_discrete_map={
+                "positive": "#2ecc71",
+                "negative": "#e74c3c",
+                "neutral": "#95a5a6"
+            }
         )
 
         st.plotly_chart(
             fig,
-            use_container_width=True,
+            use_container_width=True
         )
 
+
     # ========================================================
-    # PARTY + ISSUES
+    # PARTY ANALYSIS
     # ========================================================
 
-    col_left, col_right = st.columns(2)
+    col_left2, col_right2 = st.columns(2)
 
-    with col_left:
+
+    with col_left2:
 
         st.subheader(
             "Sentiment by Party"
@@ -1566,39 +1738,78 @@ def show_dashboard():
             .notna()
         ]
 
-        if not party_data.empty:
 
-            party_sentiment = (
-                party_data
-                .groupby(
-                    [
-                        "party_mentioned",
-                        "sentiment_label",
-                    ]
+        if len(party_data) > 0:
+
+            party_rows = []
+
+            for _, row in party_data.iterrows():
+
+                parties = str(
+                    row["party_mentioned"]
+                ).split(",")
+
+                for party in parties:
+
+                    party = party.strip()
+
+                    if party:
+
+                        party_rows.append({
+                            "party": party,
+                            "sentiment_label":
+                                row["sentiment_label"]
+                        })
+
+
+            if party_rows:
+
+                party_expanded = pd.DataFrame(
+                    party_rows
                 )
-                .size()
-                .reset_index(
-                    name="count"
+
+                party_sentiment = (
+                    party_expanded
+                    .groupby(
+                        [
+                            "party",
+                            "sentiment_label"
+                        ]
+                    )
+                    .size()
+                    .reset_index(
+                        name="count"
+                    )
                 )
-            )
 
-            fig = px.bar(
-                party_sentiment,
-                x="party_mentioned",
-                y="count",
-                color="sentiment_label",
-                barmode="group",
-            )
 
-            fig.update_layout(
-                xaxis_title="Party",
-                yaxis_title="Mentions",
-            )
+                fig = px.bar(
+                    party_sentiment,
+                    x="party",
+                    y="count",
+                    color="sentiment_label",
+                    color_discrete_map={
+                        "positive": "#2ecc71",
+                        "negative": "#e74c3c",
+                        "neutral": "#95a5a6"
+                    }
+                )
 
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-            )
+                fig.update_layout(
+                    xaxis_title="Party",
+                    yaxis_title="Mentions"
+                )
+
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True
+                )
+
+            else:
+
+                st.info(
+                    "No party mentions found yet."
+                )
 
         else:
 
@@ -1606,7 +1817,12 @@ def show_dashboard():
                 "No party mentions found yet."
             )
 
-    with col_right:
+
+    # ========================================================
+    # TOP ISSUES
+    # ========================================================
+
+    with col_right2:
 
         st.subheader(
             "Top Issues Discussed"
@@ -1617,187 +1833,257 @@ def show_dashboard():
             .notna()
         ]
 
-        if not issue_data.empty:
 
-            issue_counts = (
-                issue_data[
-                    "issue_mentioned"
-                ]
-                .value_counts()
-                .head(10)
-            )
+        if len(issue_data) > 0:
 
-            fig = px.bar(
-                x=issue_counts.index,
-                y=issue_counts.values,
-                labels={
-                    "x": "Issue",
-                    "y": "Mentions",
-                },
-            )
+            issue_rows = []
 
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-            )
+            for _, row in issue_data.iterrows():
+
+                issues = str(
+                    row["issue_mentioned"]
+                ).split(",")
+
+                for issue in issues:
+
+                    issue = issue.strip()
+
+                    if issue:
+
+                        issue_rows.append(issue)
+
+
+            if issue_rows:
+
+                issue_counts = (
+                    pd.Series(issue_rows)
+                    .value_counts()
+                    .head(10)
+                )
+
+
+                fig = px.bar(
+                    x=issue_counts.index,
+                    y=issue_counts.values,
+                    labels={
+                        "x": "Issue",
+                        "y": "Mentions"
+                    }
+                )
+
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True
+                )
 
         else:
 
             st.info(
-                "No issues detected yet."
+                "No issue mentions found yet."
             )
+
 
     # ========================================================
     # SENTIMENT TREND
     # ========================================================
 
     st.subheader(
-        "📈 Sentiment Trend Over Time"
+        "Sentiment Trend Over Time"
     )
 
-    if not summary_df.empty:
 
-        trend_df = (
+    if len(summary_df) > 0:
+
+        summary_plot = (
             summary_df
             .sort_values("date")
         )
 
+
         fig = go.Figure()
+
 
         fig.add_trace(
             go.Scatter(
-                x=trend_df["date"],
-                y=trend_df["avg_sentiment"],
+                x=summary_plot["date"],
+                y=summary_plot["avg_sentiment"],
                 mode="lines+markers",
-                name="Average Sentiment",
+                name="Avg Sentiment",
+                line=dict(
+                    color="#3498db",
+                    width=3
+                )
             )
         )
+
 
         fig.add_hline(
             y=0,
             line_dash="dash",
+            line_color="gray"
         )
+
 
         fig.update_layout(
             xaxis_title="Date",
-            yaxis_title="Sentiment Score",
+            yaxis_title="Sentiment Score"
         )
+
 
         st.plotly_chart(
             fig,
-            use_container_width=True,
+            use_container_width=True
         )
 
-    else:
-
-        st.info(
-            "Trend data will appear after sentiment analysis."
-        )
 
     # ========================================================
     # WORD CLOUDS
     # ========================================================
 
+    col_wc1, col_wc2 = st.columns(2)
+
+
+    with col_wc1:
+
+        st.subheader(
+            "☁️ Word Cloud — Negative Posts"
+        )
+
+
+        negative_text = " ".join(
+            all_data[
+                all_data["sentiment_label"]
+                == "negative"
+            ]["text"]
+            .dropna()
+            .astype(str)
+            .map(clean_wordcloud_text)
+        )
+
+
+        if negative_text.strip():
+
+            wordcloud = WordCloud(
+                width=800,
+                height=500,
+                background_color="white",
+                colormap="Reds",
+                max_words=150,
+                collocations=False
+            ).generate(
+                negative_text
+            )
+
+
+            st.image(
+                wordcloud.to_array(),
+                use_container_width=True
+            )
+
+        else:
+
+            st.info(
+                "No negative text available."
+            )
+
+
+    with col_wc2:
+
+        st.subheader(
+            "☁️ Word Cloud — Positive Posts"
+        )
+
+
+        positive_text = " ".join(
+            all_data[
+                all_data["sentiment_label"]
+                == "positive"
+            ]["text"]
+            .dropna()
+            .astype(str)
+            .map(clean_wordcloud_text)
+        )
+
+
+        if positive_text.strip():
+
+            wordcloud = WordCloud(
+                width=800,
+                height=500,
+                background_color="white",
+                colormap="Greens",
+                max_words=150,
+                collocations=False
+            ).generate(
+                positive_text
+            )
+
+
+            st.image(
+                wordcloud.to_array(),
+                use_container_width=True
+            )
+
+        else:
+
+            st.info(
+                "No positive text available."
+            )
+
+
+    # ========================================================
+    # MOST MENTIONED PARTIES
+    # ========================================================
+
     st.subheader(
-        "☁️ Sentiment Word Clouds"
+        "👥 Most Mentioned Parties"
     )
 
-    try:
 
-        from wordcloud import WordCloud
+    party_counter = Counter()
 
-        col1, col2 = st.columns(2)
 
-        with col1:
+    for value in all_data[
+        "party_mentioned"
+    ].dropna():
 
-            st.markdown(
-                "### Negative Posts"
-            )
+        for party in str(value).split(","):
 
-            negative_text = " ".join(
-                all_data[
-                    all_data[
-                        "sentiment_label"
-                    ]
-                    == "negative"
-                ]["text"]
-                .dropna()
-                .astype(str)
-            )
+            party = party.strip()
 
-            if negative_text.strip():
+            if party:
+                party_counter[party] += 1
 
-                wordcloud = WordCloud(
-                    width=800,
-                    height=500,
-                    background_color="white",
-                ).generate(
-                    negative_text
-                )
 
-                st.image(
-                    wordcloud.to_array(),
-                    use_container_width=True,
-                )
+    if party_counter:
 
-            else:
-
-                st.info(
-                    "No negative posts yet."
-                )
-
-        with col2:
-
-            st.markdown(
-                "### Positive Posts"
-            )
-
-            positive_text = " ".join(
-                all_data[
-                    all_data[
-                        "sentiment_label"
-                    ]
-                    == "positive"
-                ]["text"]
-                .dropna()
-                .astype(str)
-            )
-
-            if positive_text.strip():
-
-                wordcloud = WordCloud(
-                    width=800,
-                    height=500,
-                    background_color="white",
-                ).generate(
-                    positive_text
-                )
-
-                st.image(
-                    wordcloud.to_array(),
-                    use_container_width=True,
-                )
-
-            else:
-
-                st.info(
-                    "No positive posts yet."
-                )
-
-    except ImportError:
-
-        st.info(
-            "WordCloud is not installed. "
-            "Add wordcloud to requirements.txt."
+        party_df = pd.DataFrame(
+            party_counter.items(),
+            columns=[
+                "Party",
+                "Mentions"
+            ]
+        ).sort_values(
+            "Mentions",
+            ascending=False
         )
+
+
+        st.dataframe(
+            party_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
 
     # ========================================================
     # RECENT POSTS
     # ========================================================
 
     st.subheader(
-        "📰 Recent Posts"
+        "🗣️ Recent Posts"
     )
+
 
     display_df = all_data[
         [
@@ -1807,43 +2093,48 @@ def show_dashboard():
             "sentiment_score",
             "party_mentioned",
             "issue_mentioned",
-            "text",
+            "text"
         ]
     ].copy()
+
 
     display_df = (
         display_df
         .sort_values(
             "collected_at",
-            ascending=False,
+            ascending=False
         )
         .head(50)
     )
 
+
     st.dataframe(
         display_df,
         use_container_width=True,
-        hide_index=True,
+        hide_index=True
     )
+
 
     # ========================================================
     # DOWNLOAD
     # ========================================================
 
     st.subheader(
-        "⬇️ Download Data"
+        "📥 Download Data"
     )
+
 
     csv = all_data.to_csv(
         index=False
     ).encode("utf-8")
+
 
     st.download_button(
         "Download CSV",
         csv,
         "swedish_election_sentiment.csv",
         "text/csv",
-        use_container_width=True,
+        use_container_width=True
     )
 
 
@@ -1851,21 +2142,8 @@ def show_dashboard():
 # MAIN
 # ============================================================
 
-def main():
+if __name__ == "__main__":
 
-    try:
-        init_database()
-
-    except Exception as e:
-
-        st.error(
-            f"Could not initialize database: {e}"
-        )
-
-        st.stop()
+    init_database()
 
     show_dashboard()
-
-
-if __name__ == "__main__":
-    main()
