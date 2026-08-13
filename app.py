@@ -49,6 +49,26 @@ APP_TITLE = "🇸🇪 Swedish Election Intelligence Monitor 2026"
 
 DB_PATH = "swedish_election_2026.db"
 
+
+def get_db_connection():
+    """Create a SQLite connection designed for Streamlit."""
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        check_same_thread=False
+    )
+
+    # Wait for another transaction instead of immediately failing
+    conn.execute("PRAGMA busy_timeout = 30000")
+
+    # WAL allows readers while another operation is writing
+    conn.execute("PRAGMA journal_mode = WAL")
+
+    # Safer/faster for this type of app
+    conn.execute("PRAGMA synchronous = NORMAL")
+
+    return conn
+
 ELECTION_DATE = datetime(2026, 9, 13)
 
 # Keep this manual and lightweight for Streamlit free tier.
