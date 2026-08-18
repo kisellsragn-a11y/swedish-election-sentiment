@@ -2,7 +2,7 @@ import os
 import re
 import sqlite3
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import Counter
 
 import pandas as pd
@@ -19,7 +19,7 @@ from plotly.subplots import make_subplots
 from wordcloud import WordCloud
 from transformers import pipeline
 
-# Optional advanced libraries – will be disabled if missing
+# Optional advanced libraries
 try:
     import gensim
     from gensim import corpora, models
@@ -52,12 +52,20 @@ try:
 except ImportError:
     build = None
 
+# Google Trends (try modern wrapper first, fall back to standard)
 try:
     from pytrends_modern import TrendReq
     from pytrends_modern.exceptions import TooManyRequestsError
+    PYTRENDS_MODERN = True
 except ImportError:
-    TrendReq = None
-    TooManyRequestsError = Exception
+    try:
+        from pytrends.request import TrendReq
+        from pytrends.exceptions import TooManyRequestsError
+        PYTRENDS_MODERN = False
+    except ImportError:
+        TrendReq = None
+        TooManyRequestsError = Exception
+        PYTRENDS_MODERN = False
 
 
 # ============================================================
@@ -78,25 +86,21 @@ st.set_page_config(
 
 APP_TITLE = "🇸🇪 Swedish Election Intelligence Monitor 2026"
 DB_PATH = "swedish_election_2026.db"
-ELECTION_DATE = datetime(2026, 9, 13)
+ELECTION_DATE = datetime(2026, 9, 13, tzinfo=timezone.utc)
 
 # Lower defaults for free tier
 DEFAULT_REDDIT_LIMIT = 80
 DEFAULT_YOUTUBE_RESULTS = 10
 DEFAULT_YOUTUBE_COMMENTS = 20
 
-# Use a smaller sentiment model to save memory
-MODEL_NAME = "cardiffnlp/twitter-xlm-roberta-base-sentiment"  # ~500 MB
-# If memory is still an issue, switch to:
-# MODEL_NAME = "distilbert-base-uncased-finetuned-sst-2-english"  # ~67 MB
-
+MODEL_NAME = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
 MIN_MENTIONS_FOR_ALERT = 5
 GOOGLE_TRENDS_TIMEFRAME = "today 3-m"
 GOOGLE_TRENDS_GEO = "SE"
 
 
 # ============================================================
-# PARTY DATA (unchanged – keep as before)
+# PARTY DATA
 # ============================================================
 
 SWEDISH_PARTIES = {
@@ -197,7 +201,7 @@ FLASHBACK_PROXY_URL = get_secret("FLASHBACK_PROXY_URL", None)
 
 
 # ============================================================
-# DATABASE (unchanged – keep as before)
+# DATABASE
 # ============================================================
 
 def get_connection():
@@ -305,7 +309,6 @@ def init_database():
                 collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Add indexes for speed
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_reddit_collected ON reddit_posts(collected_at)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_reddit_party ON reddit_posts(party_mentioned)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_reddit_sentiment ON reddit_posts(sentiment_label)")
@@ -319,7 +322,7 @@ def init_database():
 
 
 # ============================================================
-# TEXT HELPERS (unchanged)
+# TEXT HELPERS
 # ============================================================
 
 def normalize_text(text):
@@ -329,6 +332,11 @@ def normalize_text(text):
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
+def _safe_word_match(keyword, text):
+    """Check if keyword appears as a whole word in text."""
+    pattern = rf"\b{re.escape(keyword)}\b"
+    return bool(re.search(pattern, text))
+
 def detect_party(text):
     text = normalize_text(text).lower()
     if not text:
@@ -336,10 +344,11 @@ def detect_party(text):
     for party, keywords in PARTY_KEYWORDS.items():
         for keyword in keywords:
             if len(keyword) <= 3:
-                if re.search(rf"\b{re.escape(keyword)}\b", text):
+                if _safe_word_match(keyword, text):
                     return party
-            elif keyword in text:
-                return party
+            else:
+                if _safe_word_match(keyword, text):
+                    return party
     return None
 
 def detect_leader(text):
@@ -348,7 +357,7 @@ def detect_leader(text):
         return None
     for leader, keywords in LEADER_KEYWORDS.items():
         for keyword in keywords:
-            if keyword in text:
+            if _safe_word_match(keyword, text):
                 return leader
     return None
 
@@ -359,9 +368,9 @@ def detect_issue(text):
     for issue, keywords in ISSUE_KEYWORDS.items():
         for keyword in keywords:
             if len(keyword) <= 3:
-                if re.search(rf"\b{re.escape(keyword)}\b", text):
+                if _safe_word_match(keyword, text):
                     return issue
-            elif keyword in text:
+            elif _safe_word_match(keyword, text):
                 return issue
     return None
 
@@ -396,7 +405,7 @@ def sentiment_one(classifier, text):
 
 
 # ============================================================
-# ADVANCED ANALYTICS – with graceful fallback if libs missing
+# ADVANCED ANALYTICS FUNCTIONS
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
@@ -408,10 +417,9 @@ def load_spacy_model():
         return nlp
     except OSError:
         try:
-            import subprocess
-            subprocess.run(["python", "-m", "spacy", "download", "sv_core_news_sm"], check=True)
+            spacy.cli.download("sv_core_news_sm")
             return spacy.load("sv_core_news_sm")
-        except:
+        except Exception:
             return None
 
 def run_ner(texts, nlp):
@@ -419,6 +427,8 @@ def run_ner(texts, nlp):
         return []
     entities = []
     for text in texts:
+        if not text or not isinstance(text, str):
+            continue
         doc = nlp(text[:1000000])
         for ent in doc.ents:
             entities.append((ent.text, ent.label_))
@@ -428,7 +438,7 @@ def run_ner(texts, nlp):
 def run_topic_modeling(texts, num_topics=10, passes=2):
     if not GENSIM_AVAILABLE or not texts:
         return None, None
-    tokenized = [re.findall(r'\b[a-zåäö]{3,}\b', text.lower()) for text in texts]
+    tokenized = [re.findall(r'\b[a-zåäö]{3,}\b', text.lower()) for text in texts if isinstance(text, str)]
     from gensim.parsing.preprocessing import STOPWORDS
     tokenized = [[word for word in doc if word not in STOPWORDS] for doc in tokenized]
     tokenized = [doc for doc in tokenized if len(doc) > 0]
@@ -441,23 +451,26 @@ def run_topic_modeling(texts, num_topics=10, passes=2):
     topics = lda.print_topics(num_words=10)
     return topics, lda
 
-def detect_anomalies(df, column='party_mentioned', window=7, z_thresh=3):
-    if df.empty:
+def detect_anomalies(df, column="party_mentioned", window=7, z_thresh=3):
+    if df.empty or column not in df.columns:
         return pd.DataFrame()
-    df['date'] = pd.to_datetime(df['collected_at']).dt.date
-    daily = df.groupby(['date', column]).size().reset_index(name='count')
-    daily['avg'] = daily.groupby(column)['count'].transform(
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["collected_at"], errors="coerce").dt.date
+    daily = df.groupby(["date", column]).size().reset_index(name="count")
+    if daily.empty:
+        return pd.DataFrame()
+    daily["avg"] = daily.groupby(column)["count"].transform(
         lambda x: x.rolling(window, min_periods=1).mean()
     )
-    daily['std'] = daily.groupby(column)['count'].transform(
+    daily["std"] = daily.groupby(column)["count"].transform(
         lambda x: x.rolling(window, min_periods=1).std()
     )
-    daily['z'] = (daily['count'] - daily['avg']) / daily['std'].replace(0, np.nan)
-    daily['anomaly'] = daily['z'].abs() > z_thresh
-    return daily[daily['anomaly']]
+    daily["z"] = (daily["count"] - daily["avg"]) / daily["std"].replace(0, np.nan)
+    daily["anomaly"] = daily["z"].abs() > z_thresh
+    return daily[daily["anomaly"]]
 
 def forecast_simple(series, days=7):
-    if not SKLEARN_AVAILABLE or len(series) < 3:
+    if series is None or len(series) < 3:
         return None
     X = np.arange(len(series)).reshape(-1, 1)
     y = series.values
@@ -468,7 +481,7 @@ def forecast_simple(series, days=7):
 
 
 # ============================================================
-# COLLECTION FUNCTIONS (unchanged – keep as before)
+# REDDIT COLLECTION
 # ============================================================
 
 def collect_reddit(limit=DEFAULT_REDDIT_LIMIT):
@@ -489,7 +502,9 @@ def collect_reddit(limit=DEFAULT_REDDIT_LIMIT):
     cursor = conn.cursor()
     count = 0
     try:
-        limit_per_term = max(1, int(limit / max(len(SEARCH_TERMS), 1)))
+        total_combinations = len(SUBREDDITS) * len(SEARCH_TERMS)
+        limit_per_search = max(1, int(limit / max(total_combinations, 1)))
+
         for subreddit_name in SUBREDDITS:
             try:
                 subreddit = reddit.subreddit(subreddit_name)
@@ -497,7 +512,7 @@ def collect_reddit(limit=DEFAULT_REDDIT_LIMIT):
                 continue
             for term in SEARCH_TERMS:
                 try:
-                    posts = subreddit.search(term, limit=limit_per_term, sort="new")
+                    posts = subreddit.search(term, limit=limit_per_search, sort="new")
                     for post in posts:
                         title = normalize_text(getattr(post, "title", ""))
                         body = normalize_text(getattr(post, "selftext", ""))
@@ -525,11 +540,16 @@ def collect_reddit(limit=DEFAULT_REDDIT_LIMIT):
                             count += 1
                 except Exception:
                     continue
+                time.sleep(0.5)
         conn.commit()
     finally:
         conn.close()
     return count, f"Collected {count} new Reddit posts."
 
+
+# ============================================================
+# YOUTUBE COLLECTION
+# ============================================================
 
 def collect_youtube(max_results=DEFAULT_YOUTUBE_RESULTS, comments_per_video=DEFAULT_YOUTUBE_COMMENTS):
     if build is None:
@@ -593,6 +613,10 @@ def collect_youtube(max_results=DEFAULT_YOUTUBE_RESULTS, comments_per_video=DEFA
     return count, f"Collected {count} new YouTube comments."
 
 
+# ============================================================
+# FLASHBACK COLLECTION
+# ============================================================
+
 def flashback_search_url(term, page=1):
     return f"{FLASHBACK_BASE_URL}/search.php?fresh&s={requests.utils.quote(term)}&p={page}"
 
@@ -608,7 +632,7 @@ def parse_flashback_search_results(html, base_url=FLASHBACK_BASE_URL):
         if not title or len(title) < 5:
             continue
         full_url = href if href.startswith("http") else base_url + href
-        thread_root = re.sub(r"(#.*|&p=\d+)$", "", full_url)
+        thread_root = re.sub(r"[?#].*$", "", full_url)
         if thread_root in seen:
             continue
         seen.add(thread_root)
@@ -618,17 +642,41 @@ def parse_flashback_search_results(html, base_url=FLASHBACK_BASE_URL):
 def parse_flashback_thread(html):
     soup = BeautifulSoup(html, "html.parser")
     posts = []
-    for message_div in soup.find_all("div", id=re.compile(r"^post_message_\d+")):
-        post_id = message_div["id"].replace("post_message_", "")
+    post_containers = soup.find_all("div", class_=re.compile(r"post|message", re.I))
+
+    for container in post_containers:
+        message_div = container.find("div", id=re.compile(r"^post_message_\d+"))
+        if not message_div:
+            if container.get("id", "").startswith("post_message_"):
+                message_div = container
+            else:
+                continue
+
+        post_id = message_div.get("id", "").replace("post_message_", "")
+        if not post_id:
+            continue
+
         text = normalize_text(message_div.get_text(" ", strip=True))
         if not text:
             continue
+
         author = ""
+        author_elem = container.find("a", class_=re.compile(r"user|author|member", re.I))
+        if author_elem:
+            author = normalize_text(author_elem.get_text())
+
+        if not author:
+            author_elem = container.find(attrs={"data-author": True})
+            if author_elem:
+                author = normalize_text(author_elem.get("data-author", ""))
+
         posted_at = ""
-        author_tag = soup.find("a", attrs={"data-author-id": True}, href=re.compile(rf"post{post_id}|#post{post_id}"))
-        if author_tag:
-            author = normalize_text(author_tag.get_text())
+        time_elem = container.find("time") or container.find("span", class_=re.compile(r"time|date", re.I))
+        if time_elem:
+            posted_at = time_elem.get("datetime", "") or normalize_text(time_elem.get_text())
+
         posts.append({"post_id": post_id, "author": author, "text": text, "posted_at": posted_at})
+
     return posts
 
 def collect_flashback(threads_per_term=DEFAULT_FLASHBACK_THREADS_PER_TERM, posts_per_thread=DEFAULT_FLASHBACK_POSTS_PER_THREAD):
@@ -699,9 +747,13 @@ def collect_flashback(threads_per_term=DEFAULT_FLASHBACK_THREADS_PER_TERM, posts
     return count, msg
 
 
+# ============================================================
+# GOOGLE TRENDS COLLECTION
+# ============================================================
+
 def collect_google_trends(timeframe=GOOGLE_TRENDS_TIMEFRAME, geo=GOOGLE_TRENDS_GEO):
     if TrendReq is None:
-        return 0, "pytrends-modern is not installed."
+        return 0, "pytrends is not installed."
     terms = list(SWEDISH_PARTIES.keys())
     chunks = [terms[i:i+5] for i in range(0, len(terms), 5)]
     conn = get_connection()
@@ -745,6 +797,10 @@ def collect_google_trends(timeframe=GOOGLE_TRENDS_TIMEFRAME, geo=GOOGLE_TRENDS_G
     return count, f"Collected {count} Google Trends data points."
 
 
+# ============================================================
+# COLLECTION RUNS
+# ============================================================
+
 def record_collection_run(reddit_count, youtube_count, flashback_count=0):
     conn = get_connection()
     try:
@@ -784,8 +840,8 @@ def analyze_database():
             analyzed += 1
 
         cursor.execute("SELECT id, text FROM youtube_comments WHERE sentiment_label IS NULL LIMIT ?", (BATCH,))
-        youtube_comments = cursor.fetchall()
-        for comment_id, text in youtube_comments:
+        youtube_comments_list = cursor.fetchall()
+        for comment_id, text in youtube_comments_list:
             label, score = sentiment_one(classifier, text)
             cursor.execute("UPDATE youtube_comments SET sentiment_label=?, sentiment_score=? WHERE id=?", (label, score, comment_id))
             analyzed += 1
@@ -877,7 +933,7 @@ def load_google_trends():
 
 
 # ============================================================
-# PREPARE DATA (unchanged)
+# PREPARE DATA
 # ============================================================
 
 def prepare_all_data():
@@ -937,7 +993,7 @@ def prepare_all_data():
 
 
 # ============================================================
-# CORE DASHBOARD HELPERS (unchanged)
+# CORE DASHBOARD HELPERS
 # ============================================================
 
 def percentage(part, total):
@@ -959,11 +1015,11 @@ def get_previous_collection_counts():
 def calculate_trends(df):
     if df.empty:
         return {}
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     recent_cutoff = now - timedelta(days=1)
     previous_cutoff = now - timedelta(days=2)
     temp = df.copy()
-    temp["collected_dt"] = pd.to_datetime(temp["collected_at"], errors="coerce")
+    temp["collected_dt"] = pd.to_datetime(temp["collected_at"], errors="coerce", utc=True)
     recent = temp[temp["collected_dt"] >= recent_cutoff]
     previous = temp[(temp["collected_dt"] >= previous_cutoff) & (temp["collected_dt"] < recent_cutoff)]
     results = {}
@@ -1011,7 +1067,9 @@ STOPWORDS = {"och", "att", "det", "som", "för", "den", "med", "på", "är", "en
 def extract_keywords(texts, limit=30):
     counter = Counter()
     for text in texts:
-        words = re.findall(r"[A-Za-zÅÄÖåäöÉé\-]{4,}", str(text).lower())
+        if not isinstance(text, str):
+            continue
+        words = re.findall(r"[A-Za-zÅÄÖåäöÉé\-]{4,}", text.lower())
         for word in words:
             if word in STOPWORDS:
                 continue
@@ -1088,7 +1146,7 @@ def generate_intelligence_brief(df, trends, bloc_summary=None):
     top_leader = leader_counts.index[0] if len(leader_counts) else "No dominant leader detected"
     brief = []
     brief.append("# Campaign Intelligence Brief")
-    brief.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    brief.append(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     brief.append("")
     brief.append("## Overall conversation")
     brief.append(f"- Analyzed items: **{total:,}**")
@@ -1127,6 +1185,21 @@ def generate_intelligence_brief(df, trends, bloc_summary=None):
     brief.append("")
     brief.append("Use large changes, engagement spikes and recurring narratives as subjects for further investigation rather than as direct measures of voter preference.")
     return "\n".join(brief)
+
+
+# ============================================================
+# SAFE RERUN HELPER
+# ============================================================
+
+def _safe_rerun():
+    """Safely rerun the app, compatible with older Streamlit versions."""
+    try:
+        st.rerun()
+    except AttributeError:
+        try:
+            st.experimental_rerun()
+        except AttributeError:
+            st.warning("Please refresh the page manually.")
 
 
 # ============================================================
@@ -1208,54 +1281,70 @@ def show_sidebar():
             load_collection_history.clear()
             load_google_trends.clear()
             count_pending_analysis.clear()
-            st.rerun()
+            _safe_rerun()
 
-        # Clear data
+        # Clear data confirmation using session state
+        st.markdown("---")
+        if "confirm_clear" not in st.session_state:
+            st.session_state.confirm_clear = False
+
         if st.button("🗑️ Clear All Data", use_container_width=True):
-            if st.checkbox("Confirm deletion of all data?"):
-                conn = get_connection()
-                try:
-                    conn.execute("DELETE FROM reddit_posts")
-                    conn.execute("DELETE FROM youtube_comments")
-                    conn.execute("DELETE FROM flashback_posts")
-                    conn.execute("DELETE FROM google_trends")
-                    conn.execute("DELETE FROM collection_runs")
-                    conn.execute("DELETE FROM analysis_runs")
-                    conn.commit()
-                    st.success("All data cleared.")
-                    load_all_data.clear()
-                    load_collection_history.clear()
-                    load_google_trends.clear()
-                    count_pending_analysis.clear()
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error clearing data: {e}")
-                finally:
-                    conn.close()
+            st.session_state.confirm_clear = True
+            _safe_rerun()
+
+        if st.session_state.confirm_clear:
+            st.warning("⚠️ This will delete ALL collected data!")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Yes, delete everything", use_container_width=True, key="confirm_delete"):
+                    conn = get_connection()
+                    try:
+                        conn.execute("DELETE FROM reddit_posts")
+                        conn.execute("DELETE FROM youtube_comments")
+                        conn.execute("DELETE FROM flashback_posts")
+                        conn.execute("DELETE FROM google_trends")
+                        conn.execute("DELETE FROM collection_runs")
+                        conn.execute("DELETE FROM analysis_runs")
+                        conn.commit()
+                        st.success("All data cleared.")
+                        load_all_data.clear()
+                        load_collection_history.clear()
+                        load_google_trends.clear()
+                        count_pending_analysis.clear()
+                        st.session_state.confirm_clear = False
+                        _safe_rerun()
+                    except Exception as e:
+                        st.error(f"Error clearing data: {e}")
+                    finally:
+                        conn.close()
+            with col2:
+                if st.button("❌ Cancel", use_container_width=True, key="cancel_delete"):
+                    st.session_state.confirm_clear = False
+                    _safe_rerun()
 
         st.markdown("---")
         st.subheader("🔬 Advanced Analytics")
-        # Only show buttons if the required libraries are available, but always show with a warning if not.
-        advanced_status = []
-        if not GENSIM_AVAILABLE:
-            advanced_status.append("Topic modelling disabled (gensim missing)")
-        if not SPACY_AVAILABLE:
-            advanced_status.append("NER disabled (spacy missing)")
-        if not SKLEARN_AVAILABLE:
-            advanced_status.append("Forecast disabled (scikit-learn missing)")
-        if advanced_status:
-            st.caption("⚠️ " + " | ".join(advanced_status))
+
+        # Initialize session state keys
+        for key in ["run_topic", "run_ner", "run_anomaly", "run_network", "run_forecast"]:
+            if key not in st.session_state:
+                st.session_state[key] = False
 
         if st.button("🧠 Run Topic Modelling", use_container_width=True):
-            st.session_state['run_topic'] = True
+            st.session_state["run_topic"] = True
+            _safe_rerun()
         if st.button("🏷️ Run NER", use_container_width=True):
-            st.session_state['run_ner'] = True
+            st.session_state["run_ner"] = True
+            _safe_rerun()
         if st.button("📈 Detect Anomalies", use_container_width=True):
-            st.session_state['run_anomaly'] = True
+            st.session_state["run_anomaly"] = True
+            _safe_rerun()
         if st.button("🔗 Build Co-occurrence Network", use_container_width=True):
-            st.session_state['run_network'] = True
+            st.session_state["run_network"] = True
+            _safe_rerun()
         if st.button("📉 Forecast 7 Days", use_container_width=True):
-            st.session_state['run_forecast'] = True
+            st.session_state["run_forecast"] = True
+            _safe_rerun()
 
         st.markdown("---")
         st.subheader("🧠 Model")
@@ -1273,7 +1362,8 @@ def show_sidebar():
 def show_dashboard():
     show_sidebar()
     st.title(APP_TITLE)
-    days_until = (ELECTION_DATE - datetime.now()).days
+    now = datetime.now(timezone.utc)
+    days_until = (ELECTION_DATE - now).days
     if days_until >= 0:
         st.markdown(f"**Riksdagsval: 13 September 2026** | **{days_until} days remaining**")
     else:
@@ -1312,6 +1402,10 @@ def show_dashboard():
 
     if analyzed.empty:
         st.warning("Data collected but not analyzed. Run sentiment analysis in sidebar.")
+        # Still show raw data tables even if not analyzed
+        st.subheader("📋 Raw Collected Data")
+        st.dataframe(df[["source", "collected_at", "title", "display_text", "party_mentioned", "issue_mentioned"]].head(50),
+                     use_container_width=True, hide_index=True)
         return
 
     trends = calculate_trends(df)
@@ -1334,17 +1428,23 @@ def show_dashboard():
     col_left, col_right = st.columns(2)
     with col_left:
         sentiment_counts = analyzed["sentiment_label"].value_counts()
-        fig = px.pie(values=sentiment_counts.values, names=sentiment_counts.index,
-                     title="Sentiment Distribution",
-                     color=sentiment_counts.index,
-                     color_discrete_map={"positive": "#2ecc71", "negative": "#e74c3c", "neutral": "#95a5a6"})
-        st.plotly_chart(fig, use_container_width=True)
+        if not sentiment_counts.empty:
+            fig = px.pie(values=sentiment_counts.values, names=sentiment_counts.index,
+                         title="Sentiment Distribution",
+                         color=sentiment_counts.index,
+                         color_discrete_map={"positive": "#2ecc71", "negative": "#e74c3c", "neutral": "#95a5a6"})
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No sentiment data available.")
     with col_right:
         source_sentiment = analyzed.groupby(["source", "sentiment_label"]).size().reset_index(name="count")
-        fig = px.bar(source_sentiment, x="source", y="count", color="sentiment_label",
-                     title="Sentiment by Source",
-                     color_discrete_map={"positive": "#2ecc71", "negative": "#e74c3c", "neutral": "#95a5a6"})
-        st.plotly_chart(fig, use_container_width=True)
+        if not source_sentiment.empty:
+            fig = px.bar(source_sentiment, x="source", y="count", color="sentiment_label",
+                         title="Sentiment by Source",
+                         color_discrete_map={"positive": "#2ecc71", "negative": "#e74c3c", "neutral": "#95a5a6"})
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No source sentiment data available.")
 
     # Bloc
     st.subheader("⚖️ Bloc Intelligence (Left / Right / Center)")
@@ -1389,11 +1489,12 @@ def show_dashboard():
             Engagement=("engagement", "sum")
         ).reset_index().sort_values("Mentions", ascending=False)
         st.dataframe(party_summary, use_container_width=True, hide_index=True)
-        fig = px.bar(party_data.groupby(["party_mentioned", "sentiment_label"]).size().reset_index(name="count"),
-                     x="party_mentioned", y="count", color="sentiment_label",
-                     title="Party Mentions by Sentiment",
-                     color_discrete_map={"positive": "#2ecc71", "negative": "#e74c3c", "neutral": "#95a5a6"})
-        st.plotly_chart(fig, use_container_width=True)
+        party_sentiment = party_data.groupby(["party_mentioned", "sentiment_label"]).size().reset_index(name="count")
+        if not party_sentiment.empty:
+            fig = px.bar(party_sentiment, x="party_mentioned", y="count", color="sentiment_label",
+                         title="Party Mentions by Sentiment",
+                         color_discrete_map={"positive": "#2ecc71", "negative": "#e74c3c", "neutral": "#95a5a6"})
+            st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("No party mentions detected.")
 
@@ -1429,6 +1530,8 @@ def show_dashboard():
         fig = px.bar(x=issue_counts.index, y=issue_counts.values, labels={"x": "Issue", "y": "Mentions"},
                      title="Most Discussed Issues")
         st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No issue data available.")
 
     # Google Trends
     st.subheader("📈 Google Search Interest")
@@ -1498,6 +1601,8 @@ def show_dashboard():
     if keywords:
         keyword_df = pd.DataFrame(keywords, columns=["Keyword", "Count"])
         st.dataframe(keyword_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No keywords extracted yet.")
 
     # Sentiment Trend
     st.subheader("📈 Sentiment Trend")
@@ -1510,6 +1615,8 @@ def show_dashboard():
         fig.add_hline(y=0, line_dash="dash")
         fig.update_layout(xaxis_title="Date", yaxis_title="Sentiment")
         st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Not enough data for sentiment trend.")
 
     # Word Clouds
     st.subheader("☁️ Conversation Word Clouds")
@@ -1517,19 +1624,19 @@ def show_dashboard():
     with wc_left:
         st.markdown("### Negative conversation")
         neg_text = " ".join(analyzed[analyzed["sentiment_label"] == "negative"]["display_text"].dropna().astype(str))
-        if neg_text.strip():
+        if neg_text.strip() and len(neg_text.strip()) > 50:
             wc = WordCloud(width=800, height=450, background_color="white", colormap="Reds").generate(neg_text)
             st.image(wc.to_array(), use_container_width=True)
         else:
-            st.info("No negative text.")
+            st.info("Not enough negative text for word cloud (need >50 chars).")
     with wc_right:
         st.markdown("### Positive conversation")
         pos_text = " ".join(analyzed[analyzed["sentiment_label"] == "positive"]["display_text"].dropna().astype(str))
-        if pos_text.strip():
+        if pos_text.strip() and len(pos_text.strip()) > 50:
             wc = WordCloud(width=800, height=450, background_color="white", colormap="Greens").generate(pos_text)
             st.image(wc.to_array(), use_container_width=True)
         else:
-            st.info("No positive text.")
+            st.info("Not enough positive text for word cloud (need >50 chars).")
 
     # Collection History
     st.subheader("🕐 Collection History")
@@ -1545,101 +1652,93 @@ def show_dashboard():
     st.text(brief)
 
     # ============================================================
-    # ADVANCED ANALYTICS SECTIONS (with proper fallback messages)
+    # ADVANCED ANALYTICS SECTIONS (triggered by sidebar buttons)
     # ============================================================
 
     # Topic Modelling
-    if st.session_state.get('run_topic', False):
+    if st.session_state.get("run_topic", False):
         st.subheader("🧠 Topic Modelling (LDA)")
-        if not GENSIM_AVAILABLE:
-            st.error("Topic modelling is disabled because 'gensim' is not installed.")
-        else:
-            with st.spinner("Running LDA on collected texts..."):
-                texts = df['display_text'].dropna().tolist()
-                if len(texts) > 10:
-                    topics, model = run_topic_modeling(texts, num_topics=8)
-                    if topics:
-                        for idx, (topic_id, words) in enumerate(topics):
-                            st.markdown(f"**Topic {idx+1}:** {words}")
-                    else:
-                        st.info("Not enough text for topic modelling.")
+        with st.spinner("Running LDA on collected texts..."):
+            texts = df["display_text"].dropna().tolist()
+            if len(texts) > 10:
+                topics, model = run_topic_modeling(texts, num_topics=8)
+                if topics:
+                    for idx, (topic_id, words) in enumerate(topics):
+                        st.markdown(f"**Topic {idx+1}:** {words}")
                 else:
-                    st.warning("Need more data (at least 10 texts).")
-        st.session_state['run_topic'] = False
+                    st.info("Not enough text for topic modelling.")
+            else:
+                st.warning("Need more data (at least 10 texts).")
+        st.session_state["run_topic"] = False
 
     # NER
-    if st.session_state.get('run_ner', False):
+    if st.session_state.get("run_ner", False):
         st.subheader("🏷️ Named Entity Recognition")
-        if not SPACY_AVAILABLE:
-            st.error("NER is disabled because 'spacy' is not installed.")
+        nlp = load_spacy_model()
+        if nlp is None:
+            st.error("spaCy Swedish model not available. Please install 'sv_core_news_sm'.")
         else:
-            nlp = load_spacy_model()
-            if nlp is None:
-                st.error("Swedish spaCy model could not be loaded. Please install 'sv_core_news_sm'.")
-            else:
-                with st.spinner("Extracting entities..."):
-                    texts = df['display_text'].dropna().tolist()[:200]
-                    entities = run_ner(texts, nlp)
-                    if entities:
-                        ent_df = pd.DataFrame(entities, columns=['Entity', 'Type'])
-                        ent_counts = ent_df.groupby(['Entity', 'Type']).size().reset_index(name='Count')
-                        st.dataframe(ent_counts.sort_values('Count', ascending=False).head(20), use_container_width=True)
-                    else:
-                        st.info("No entities found.")
-        st.session_state['run_ner'] = False
+            with st.spinner("Extracting entities..."):
+                texts = df["display_text"].dropna().tolist()[:200]
+                entities = run_ner(texts, nlp)
+                if entities:
+                    ent_df = pd.DataFrame(entities, columns=["Entity", "Type"])
+                    ent_counts = ent_df.groupby(["Entity", "Type"]).size().reset_index(name="Count")
+                    st.dataframe(ent_counts.sort_values("Count", ascending=False).head(20), use_container_width=True)
+                else:
+                    st.info("No entities found.")
+        st.session_state["run_ner"] = False
 
-    # Anomaly Detection (this doesn't need external libs, works fine)
-    if st.session_state.get('run_anomaly', False):
+    # Anomaly Detection
+    if st.session_state.get("run_anomaly", False):
         st.subheader("📈 Anomaly Detection (Z-score)")
         if not df.empty:
-            anomalies = detect_anomalies(df, column='party_mentioned')
+            anomalies = detect_anomalies(df, column="party_mentioned")
             if not anomalies.empty:
                 st.dataframe(anomalies, use_container_width=True)
-                fig = px.scatter(anomalies, x='date', y='count', color='party_mentioned',
+                fig = px.scatter(anomalies, x="date", y="count", color="party_mentioned",
                                  title="Anomalous Party Mention Spikes")
                 st.plotly_chart(fig)
             else:
                 st.info("No anomalies detected.")
         else:
             st.warning("No data.")
-        st.session_state['run_anomaly'] = False
+        st.session_state["run_anomaly"] = False
 
-    # Co-occurrence Network (heatmap) – also doesn't require extra libs
-    if st.session_state.get('run_network', False):
+    # Co-occurrence Network (heatmap)
+    if st.session_state.get("run_network", False):
         st.subheader("🔗 Party-Issue Co-occurrence Network")
-        subset = df[df['party_mentioned'].notna() & df['issue_mentioned'].notna()]
+        subset = df[df["party_mentioned"].notna() & df["issue_mentioned"].notna()]
         if not subset.empty:
-            edges = subset.groupby(['party_mentioned', 'issue_mentioned']).size().reset_index(name='weight')
-            matrix = edges.pivot(index='party_mentioned', columns='issue_mentioned', values='weight').fillna(0)
+            edges = subset.groupby(["party_mentioned", "issue_mentioned"]).size().reset_index(name="weight")
+            matrix = edges.pivot(index="party_mentioned", columns="issue_mentioned", values="weight").fillna(0)
             fig = px.imshow(matrix, text_auto=True, aspect="auto", title="Party × Issue Co-occurrence")
             st.plotly_chart(fig)
         else:
             st.warning("Not enough co-occurrence data.")
-        st.session_state['run_network'] = False
+        st.session_state["run_network"] = False
 
     # Forecast
-    if st.session_state.get('run_forecast', False):
+    if st.session_state.get("run_forecast", False):
         st.subheader("📉 7-Day Forecast")
-        if not SKLEARN_AVAILABLE:
-            st.error("Forecast is disabled because 'scikit-learn' is not installed.")
-        else:
-            df['date'] = pd.to_datetime(df['collected_at']).dt.date
-            daily_sent = df.groupby('date')['sentiment_score'].mean().dropna()
-            if len(daily_sent) > 2:
-                pred = forecast_simple(daily_sent, days=7)
-                if pred is not None:
-                    future_dates = [daily_sent.index[-1] + timedelta(days=i+1) for i in range(7)]
-                    forecast_df = pd.DataFrame({'date': future_dates, 'predicted_sentiment': pred})
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=daily_sent.index, y=daily_sent.values, mode='lines+markers', name='Historical'))
-                    fig.add_trace(go.Scatter(x=forecast_df['date'], y=forecast_df['predicted_sentiment'], mode='lines+markers', name='Forecast', line=dict(dash='dash')))
-                    fig.update_layout(title='Sentiment Forecast (7 days)')
-                    st.plotly_chart(fig)
-                else:
-                    st.warning("Not enough data for forecast.")
+        forecast_df_input = df.copy()
+        forecast_df_input["date"] = pd.to_datetime(forecast_df_input["collected_at"]).dt.date
+        daily_sent = forecast_df_input.groupby("date")["sentiment_score"].mean().dropna()
+        if len(daily_sent) > 2:
+            pred = forecast_simple(daily_sent, days=7)
+            if pred is not None:
+                future_dates = [daily_sent.index[-1] + timedelta(days=i+1) for i in range(7)]
+                forecast_df = pd.DataFrame({"date": future_dates, "predicted_sentiment": pred})
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=daily_sent.index, y=daily_sent.values, mode="lines+markers", name="Historical"))
+                fig.add_trace(go.Scatter(x=forecast_df["date"], y=forecast_df["predicted_sentiment"], mode="lines+markers", name="Forecast", line=dict(dash="dash")))
+                fig.update_layout(title="Sentiment Forecast (7 days)")
+                st.plotly_chart(fig)
             else:
-                st.warning("Need at least 3 days of data.")
-        st.session_state['run_forecast'] = False
+                st.warning("Not enough data for forecast.")
+        else:
+            st.warning("Need at least 3 days of data.")
+        st.session_state["run_forecast"] = False
 
 
 # ============================================================
