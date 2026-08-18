@@ -1,8 +1,3 @@
-# ============================================================
-# 🇸🇪 SWEDISH ELECTION SENTIMENT MONITOR 2026
-# Complete Streamlit application
-# ============================================================
-
 import os
 import re
 import sqlite3
