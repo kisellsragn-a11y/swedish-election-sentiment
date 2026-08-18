@@ -28,6 +28,12 @@ try:
 except ImportError:
     build = None
 
+# Google Trends (unofficial API wrapper)
+try:
+    from pytrends.request import TrendReq
+except ImportError:
+    TrendReq = None
+
 
 # ============================================================
 # PAGE CONFIG
@@ -49,26 +55,6 @@ APP_TITLE = "🇸🇪 Swedish Election Intelligence Monitor 2026"
 
 DB_PATH = "swedish_election_2026.db"
 
-
-def get_db_connection():
-    """Create a SQLite connection designed for Streamlit."""
-    conn = sqlite3.connect(
-        DB_PATH,
-        timeout=30,
-        check_same_thread=False
-    )
-
-    # Wait for another transaction instead of immediately failing
-    conn.execute("PRAGMA busy_timeout = 30000")
-
-    # WAL allows readers while another operation is writing
-    conn.execute("PRAGMA journal_mode = WAL")
-
-    # Safer/faster for this type of app
-    conn.execute("PRAGMA synchronous = NORMAL")
-
-    return conn
-
 ELECTION_DATE = datetime(2026, 9, 13)
 
 # Keep this manual and lightweight for Streamlit free tier.
@@ -77,6 +63,14 @@ DEFAULT_YOUTUBE_RESULTS = 15
 DEFAULT_YOUTUBE_COMMENTS = 30
 
 MODEL_NAME = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
+
+# Minimum recent mentions required before we call something a
+# "spike" at all — avoids flagging noise (e.g. 1 -> 2 mentions).
+MIN_MENTIONS_FOR_ALERT = 5
+
+# How far back Google Trends should look by default.
+GOOGLE_TRENDS_TIMEFRAME = "today 3-m"
+GOOGLE_TRENDS_GEO = "SE"
 
 
 # ============================================================
@@ -124,6 +118,12 @@ SWEDISH_PARTIES = {
         "abbrev": "V",
         "bloc": "left",
     },
+}
+
+BLOC_COLORS = {
+    "left": "#e74c3c",
+    "right": "#3498db",
+    "center": "#f1c40f",
 }
 
 
@@ -521,6 +521,19 @@ def init_database():
             """
         )
 
+        # NEW: Google Trends search-interest data.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS google_trends (
+                date TEXT NOT NULL,
+                term TEXT NOT NULL,
+                interest INTEGER DEFAULT 0,
+                collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (date, term)
+            )
+            """
+        )
+
         # Add columns if an older database exists.
         add_column_if_missing(
             cursor,
@@ -652,6 +665,17 @@ def detect_issue(text):
                 return issue
 
     return None
+
+
+def get_bloc(party_name):
+    """Returns 'left', 'right', 'center', or None for a party name."""
+
+    info = SWEDISH_PARTIES.get(party_name)
+
+    if not info:
+        return None
+
+    return info.get("bloc")
 
 
 # ============================================================
@@ -1038,6 +1062,121 @@ def collect_youtube(
 
 
 # ============================================================
+# GOOGLE TRENDS COLLECTION  (NEW)
+# ============================================================
+
+def collect_google_trends(
+    timeframe=GOOGLE_TRENDS_TIMEFRAME,
+    geo=GOOGLE_TRENDS_GEO,
+):
+    """
+    Pulls Google search-interest-over-time for each party name,
+    scoped to Sweden. Uses pytrends, an unofficial wrapper around
+    Google Trends (no API key required, but it can be rate-limited
+    or temporarily blocked, especially from shared cloud IPs like
+    Streamlit Community Cloud — retry later if it fails).
+
+    Interest is Google's own 0-100 relative scale, not raw search
+    volume, and it's rescaled per request, so only compare terms
+    that were fetched together (which this function guarantees by
+    batching all party terms into groups of <=5 per call).
+    """
+
+    if TrendReq is None:
+        return 0, "pytrends is not installed."
+
+    terms = list(SWEDISH_PARTIES.keys())
+
+    # pytrends allows a maximum of 5 terms per payload.
+    chunks = [terms[i:i + 5] for i in range(0, len(terms), 5)]
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    count = 0
+    errors = []
+
+    try:
+
+        pytrends = TrendReq(hl="sv-SE", tz=60)
+
+        for chunk in chunks:
+
+            try:
+
+                pytrends.build_payload(
+                    chunk,
+                    timeframe=timeframe,
+                    geo=geo,
+                )
+
+                data = pytrends.interest_over_time()
+
+                if data is None or data.empty:
+                    continue
+
+                for date_index, row in data.iterrows():
+
+                    date_str = date_index.strftime("%Y-%m-%d")
+
+                    for term in chunk:
+
+                        if term not in row:
+                            continue
+
+                        interest_value = int(row[term])
+
+                        cursor.execute(
+                            """
+                            INSERT OR REPLACE INTO google_trends
+                            (date, term, interest)
+                            VALUES (?, ?, ?)
+                            """,
+                            (
+                                date_str,
+                                term,
+                                interest_value,
+                            ),
+                        )
+
+                        count += 1
+
+                # Be polite to Google's rate limits between batches.
+                time.sleep(1.5)
+
+            except Exception as e:
+                errors.append(str(e))
+                continue
+
+        conn.commit()
+
+    except Exception as e:
+        return 0, f"Google Trends initialization failed: {e}"
+
+    finally:
+        conn.close()
+
+    if count == 0 and errors:
+        return 0, f"Google Trends fetch failed: {errors[0]}"
+
+    return count, f"Collected {count} Google Trends data points."
+
+
+@st.cache_data(ttl=60)
+def load_google_trends():
+
+    conn = get_connection()
+
+    try:
+        return pd.read_sql_query(
+            "SELECT * FROM google_trends ORDER BY date",
+            conn,
+        )
+    finally:
+        conn.close()
+
+
+# ============================================================
 # COLLECTION RUN
 # ============================================================
 
@@ -1218,6 +1357,40 @@ def analyze_database():
             conn.close()
 
     return analyzed
+
+
+# ============================================================
+# PENDING ANALYSIS COUNT  (NEW)
+# ============================================================
+
+@st.cache_data(ttl=15)
+def count_pending_analysis():
+    """
+    Returns how many collected items still have no sentiment
+    label, so the sidebar can show a visible backlog instead of
+    silently capping at 300 items per analysis run.
+    """
+
+    conn = get_connection()
+
+    try:
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT COUNT(*) FROM reddit_posts WHERE sentiment_label IS NULL"
+        )
+        reddit_pending = cursor.fetchone()[0]
+
+        cursor.execute(
+            "SELECT COUNT(*) FROM youtube_comments WHERE sentiment_label IS NULL"
+        )
+        youtube_pending = cursor.fetchone()[0]
+
+        return reddit_pending + youtube_pending
+
+    finally:
+        conn.close()
 
 
 # ============================================================
@@ -1576,6 +1749,52 @@ def calculate_trends(df):
 
 
 # ============================================================
+# BLOC-LEVEL ROLLUP  (NEW)
+# ============================================================
+
+def calculate_bloc_summary(analyzed_df):
+    """
+    Aggregates party-level mentions/sentiment into left/right/center
+    blocs. Swedish elections are decided by coalition blocs, not
+    individual party vote share, so this is usually the more
+    predictive view than party-by-party alone.
+    """
+
+    party_data = analyzed_df[
+        analyzed_df["party_mentioned"].notna()
+    ].copy()
+
+    if party_data.empty:
+        return pd.DataFrame()
+
+    party_data["bloc"] = party_data["party_mentioned"].apply(
+        get_bloc
+    )
+
+    party_data = party_data[
+        party_data["bloc"].notna()
+    ]
+
+    if party_data.empty:
+        return pd.DataFrame()
+
+    summary = (
+        party_data.groupby("bloc")
+        .agg(
+            Mentions=("bloc", "size"),
+            Avg_Sentiment=("sentiment_score", "mean"),
+            Engagement=("engagement", "sum"),
+        )
+        .reset_index()
+        .rename(columns={"bloc": "Bloc"})
+    )
+
+    summary["Bloc"] = summary["Bloc"].str.capitalize()
+
+    return summary.sort_values("Mentions", ascending=False)
+
+
+# ============================================================
 # KEYWORD / NARRATIVE ANALYSIS
 # ============================================================
 
@@ -1743,10 +1962,21 @@ def narrative_summary(df):
 
 
 # ============================================================
-# ALERTS
+# ALERTS  (FIXED)
 # ============================================================
 
 def generate_alerts(df, trends):
+    """
+    Two categories are now distinguished, where the original
+    version conflated them and labeled both as "spikes":
+
+    - "New activity": Previous == 0. This just means an issue or
+      party had zero recorded mentions in the prior window — it
+      says nothing about the size or rate of a real increase.
+    - "Real spike": Previous > 0 and growth crossed the threshold.
+      This is an actual measured increase and is the only case
+      that should be called a spike.
+    """
 
     alerts = []
 
@@ -1783,7 +2013,7 @@ def generate_alerts(df, trends):
                 )
             )
 
-    # Issue spikes.
+    # Issue changes.
     issue_trends = trends.get(
         "issues",
         pd.DataFrame(),
@@ -1791,23 +2021,35 @@ def generate_alerts(df, trends):
 
     if not issue_trends.empty:
 
-        for _, row in issue_trends.head(3).iterrows():
+        for _, row in issue_trends.head(5).iterrows():
 
-            if (
-                row["Change %"] >= 50
-                and row["Recent"] >= 5
-            ):
+            if row["Recent"] < MIN_MENTIONS_FOR_ALERT:
+                continue
+
+            if row["Previous"] == 0:
+
+                alerts.append(
+                    (
+                        "🆕",
+                        f"New activity: {row['Issue']}",
+                        f"{int(row['Recent'])} mentions with no "
+                        "prior baseline in the comparison window.",
+                    )
+                )
+
+            elif row["Change %"] >= 50:
 
                 alerts.append(
                     (
                         "🟠",
                         f"Issue spike: {row['Issue']}",
-                        f"Mentions increased approximately "
-                        f"{row['Change %']:.0f}%.",
+                        f"Mentions rose {row['Change %']:.0f}% "
+                        f"({int(row['Previous'])} → "
+                        f"{int(row['Recent'])}).",
                     )
                 )
 
-    # Party spikes.
+    # Party changes.
     party_trends = trends.get(
         "parties",
         pd.DataFrame(),
@@ -1815,19 +2057,31 @@ def generate_alerts(df, trends):
 
     if not party_trends.empty:
 
-        for _, row in party_trends.head(3).iterrows():
+        for _, row in party_trends.head(5).iterrows():
 
-            if (
-                row["Change %"] >= 50
-                and row["Recent"] >= 5
-            ):
+            if row["Recent"] < MIN_MENTIONS_FOR_ALERT:
+                continue
+
+            if row["Previous"] == 0:
+
+                alerts.append(
+                    (
+                        "🆕",
+                        f"New activity: {row['Party']}",
+                        f"{int(row['Recent'])} mentions with no "
+                        "prior baseline in the comparison window.",
+                    )
+                )
+
+            elif row["Change %"] >= 50:
 
                 alerts.append(
                     (
                         "🟠",
                         f"Attention spike: {row['Party']}",
-                        f"Mentions increased approximately "
-                        f"{row['Change %']:.0f}%.",
+                        f"Mentions rose {row['Change %']:.0f}% "
+                        f"({int(row['Previous'])} → "
+                        f"{int(row['Recent'])}).",
                     )
                 )
 
@@ -1838,7 +2092,7 @@ def generate_alerts(df, trends):
 # CAMPAIGN INTELLIGENCE BRIEF
 # ============================================================
 
-def generate_intelligence_brief(df, trends):
+def generate_intelligence_brief(df, trends, bloc_summary=None):
 
     if df.empty:
 
@@ -1970,6 +2224,20 @@ def generate_intelligence_brief(df, trends):
 
     brief.append("")
 
+    if bloc_summary is not None and not bloc_summary.empty:
+
+        brief.append("## Bloc-level conversation")
+
+        for _, row in bloc_summary.iterrows():
+
+            brief.append(
+                f"- {row['Bloc']}: {int(row['Mentions']):,} "
+                f"mentions, avg sentiment "
+                f"{row['Avg_Sentiment']:.3f}"
+            )
+
+        brief.append("")
+
     if not issue_counts.empty:
 
         brief.append("## Leading issues")
@@ -2009,7 +2277,8 @@ def generate_intelligence_brief(df, trends):
             brief.append(
                 f"- {row['Issue']}: "
                 f"{row['Change %']:+.0f}% change "
-                f"({int(row['Recent'])} recent mentions)"
+                f"({int(row['Recent'])} recent mentions, "
+                f"{int(row['Previous'])} previous)"
             )
 
     brief.append("")
@@ -2100,6 +2369,7 @@ def show_sidebar():
 
             load_all_data.clear()
             load_collection_history.clear()
+            count_pending_analysis.clear()
 
             st.success(
                 f"Reddit: {reddit_count} new | "
@@ -2121,10 +2391,50 @@ def show_sidebar():
                 analyzed = analyze_database()
 
             load_all_data.clear()
+            count_pending_analysis.clear()
 
             st.success(
                 f"Analyzed {analyzed} new items."
             )
+
+        pending = count_pending_analysis()
+
+        if pending > 0:
+
+            st.caption(
+                f"⏳ {pending:,} collected items still awaiting "
+                "sentiment analysis (300 processed per click)."
+            )
+
+        st.markdown("---")
+
+        st.subheader("📈 Google Trends")
+
+        st.caption(
+            "Unofficial API — may be rate-limited on shared "
+            "cloud IPs. Retry later if a fetch fails."
+        )
+
+        if st.button(
+            "📈 Fetch Google Trends",
+            use_container_width=True,
+        ):
+
+            with st.spinner(
+                "Fetching Google Trends data (Sweden, "
+                "last 3 months)..."
+            ):
+
+                trends_count, trends_msg = collect_google_trends()
+
+            load_google_trends.clear()
+
+            if trends_count > 0:
+                st.success(trends_msg)
+            else:
+                st.error(trends_msg)
+
+        st.markdown("---")
 
         if st.button(
             "📊 Refresh Dashboard",
@@ -2133,6 +2443,8 @@ def show_sidebar():
 
             load_all_data.clear()
             load_collection_history.clear()
+            load_google_trends.clear()
+            count_pending_analysis.clear()
 
             st.rerun()
 
@@ -2156,7 +2468,8 @@ def show_sidebar():
         for party, info in SWEDISH_PARTIES.items():
 
             st.markdown(
-                f"**{info['abbrev']}** — {party}"
+                f"**{info['abbrev']}** — {party} "
+                f"_({info['bloc']})_"
             )
 
 
@@ -2188,7 +2501,8 @@ def show_dashboard():
         )
 
     st.caption(
-        "Online political conversation monitoring from Reddit and YouTube. "
+        "Online political conversation monitoring from Reddit and YouTube, "
+        "cross-referenced with Google search interest. "
         "Manual collection is used to keep the app lightweight."
     )
 
@@ -2299,6 +2613,8 @@ def show_dashboard():
 
     trends = calculate_trends(df)
 
+    bloc_summary = calculate_bloc_summary(analyzed)
+
     # ========================================================
     # ALERTS
     # ========================================================
@@ -2314,9 +2630,10 @@ def show_dashboard():
 
         for icon, title, message in alerts:
 
-            st.warning(
-                f"{icon} **{title}** — {message}"
-            )
+            if icon == "🆕":
+                st.info(f"{icon} **{title}** — {message}")
+            else:
+                st.warning(f"{icon} **{title}** — {message}")
 
     else:
 
@@ -2393,6 +2710,55 @@ def show_dashboard():
         )
 
     # ========================================================
+    # BLOC INTELLIGENCE  (NEW)
+    # ========================================================
+
+    st.subheader("⚖️ Bloc Intelligence (Left / Right / Center)")
+
+    if not bloc_summary.empty:
+
+        bloc_col1, bloc_col2 = st.columns(2)
+
+        with bloc_col1:
+
+            st.dataframe(
+                bloc_summary,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with bloc_col2:
+
+            fig = px.bar(
+                bloc_summary,
+                x="Bloc",
+                y="Mentions",
+                color="Bloc",
+                title="Conversation Volume by Bloc",
+                color_discrete_map=BLOC_COLORS,
+            )
+
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+            )
+
+        st.caption(
+            "Bloc assignments reflect typical Swedish coalition "
+            "alignment (S/MP/V = left, M/SD/KD/L = right, "
+            "C = center) and are a simplification — Centerpartiet "
+            "in particular has shifted position across recent "
+            "elections."
+        )
+
+    else:
+
+        st.info(
+            "Not enough party-tagged data yet to compute a "
+            "bloc-level view."
+        )
+
+    # ========================================================
     # TRENDING
     # ========================================================
 
@@ -2417,6 +2783,12 @@ def show_dashboard():
                 issue_trends.head(10),
                 use_container_width=True,
                 hide_index=True,
+            )
+
+            st.caption(
+                "Rows with Previous = 0 are newly detected "
+                "activity, not measured growth — see Intelligence "
+                "Alerts above for the distinction."
             )
 
         else:
@@ -2642,6 +3014,113 @@ def show_dashboard():
         st.plotly_chart(
             fig,
             use_container_width=True,
+        )
+
+    # ========================================================
+    # GOOGLE TRENDS  (NEW)
+    # ========================================================
+
+    st.subheader("📈 Google Search Interest")
+
+    st.caption(
+        "Google Trends interest-over-time for each party, Sweden "
+        "only. Values are on Google's relative 0-100 scale — use "
+        "this to check whether online conversation volume tracks "
+        "real search demand, not as a standalone popularity score."
+    )
+
+    trends_df = load_google_trends()
+
+    if not trends_df.empty:
+
+        trends_df = trends_df.copy()
+
+        trends_df["date"] = pd.to_datetime(
+            trends_df["date"]
+        )
+
+        fig = px.line(
+            trends_df,
+            x="date",
+            y="interest",
+            color="term",
+            title="Search Interest Over Time by Party (Sweden)",
+        )
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+        )
+
+        latest_date = trends_df["date"].max()
+
+        latest_snapshot = (
+            trends_df[trends_df["date"] == latest_date]
+            .sort_values("interest", ascending=False)
+        )
+
+        st.markdown(
+            f"**Latest snapshot ({latest_date.strftime('%Y-%m-%d')})**"
+        )
+
+        st.dataframe(
+            latest_snapshot[["term", "interest"]].rename(
+                columns={
+                    "term": "Party",
+                    "interest": "Search Interest",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # Simple side-by-side comparison: conversation mentions
+        # vs search interest, per party, using the most recent
+        # trends snapshot alongside total analyzed mentions.
+        if not party_data.empty:
+
+            mention_counts = (
+                party_data["party_mentioned"]
+                .value_counts()
+                .rename_axis("term")
+                .reset_index(name="mentions")
+            )
+
+            comparison = latest_snapshot[
+                ["term", "interest"]
+            ].merge(
+                mention_counts,
+                on="term",
+                how="left",
+            )
+
+            comparison["mentions"] = comparison[
+                "mentions"
+            ].fillna(0)
+
+            st.markdown(
+                "**Conversation mentions vs. search interest**"
+            )
+
+            st.dataframe(
+                comparison.rename(
+                    columns={
+                        "term": "Party",
+                        "interest": "Search Interest",
+                        "mentions": "Conversation Mentions",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    else:
+
+        st.info(
+            "No Google Trends data yet. Use **Fetch Google "
+            "Trends** in the sidebar. Note this uses an "
+            "unofficial API and may need a retry if Google "
+            "temporarily rate-limits the request."
         )
 
     # ========================================================
@@ -3011,6 +3490,7 @@ def show_dashboard():
         brief = generate_intelligence_brief(
             analyzed,
             trends,
+            bloc_summary,
         )
 
         st.markdown(brief)
