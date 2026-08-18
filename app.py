@@ -375,6 +375,40 @@ YOUTUBE_QUERIES = [
 ]
 
 
+# Flashback has no official API. This scrapes its public search
+# results and thread pages directly via requests + BeautifulSoup.
+# There is no ToS carve-out for this, so keep volumes modest and
+# request delays generous — a blocked/banned IP is the likely
+# failure mode if this is run too aggressively.
+
+FLASHBACK_BASE_URL = "https://www.flashback.org"
+
+FLASHBACK_SEARCH_TERMS = [
+    "riksdagsval 2026",
+    "Socialdemokraterna",
+    "Moderaterna",
+    "Sverigedemokraterna",
+    "Magdalena Andersson",
+    "Ulf Kristersson",
+    "Jimmie Åkesson",
+    "invandring",
+    "kriminalitet",
+    "ekonomi",
+]
+
+FLASHBACK_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    )
+}
+
+DEFAULT_FLASHBACK_THREADS_PER_TERM = 3
+DEFAULT_FLASHBACK_POSTS_PER_THREAD = 20
+FLASHBACK_REQUEST_DELAY_SECONDS = 2.0
+
+
 # ============================================================
 # SECRETS
 # ============================================================
@@ -534,6 +568,29 @@ def init_database():
             """
         )
 
+        # NEW: Flashback forum posts (scraped — no official API exists).
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS flashback_posts (
+                id TEXT PRIMARY KEY,
+                source TEXT DEFAULT 'flashback',
+                thread_id TEXT,
+                thread_title TEXT,
+                thread_url TEXT,
+                author TEXT,
+                text TEXT,
+                post_number INTEGER DEFAULT 0,
+                posted_at TEXT,
+                sentiment_label TEXT,
+                sentiment_score REAL,
+                party_mentioned TEXT,
+                leader_mentioned TEXT,
+                issue_mentioned TEXT,
+                collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
         # Add columns if an older database exists.
         add_column_if_missing(
             cursor,
@@ -547,6 +604,13 @@ def init_database():
             "youtube_comments",
             "leader_mentioned",
             "TEXT",
+        )
+
+        add_column_if_missing(
+            cursor,
+            "collection_runs",
+            "flashback_count",
+            "INTEGER DEFAULT 0",
         )
 
         conn.commit()
@@ -1062,6 +1126,292 @@ def collect_youtube(
 
 
 # ============================================================
+# FLASHBACK COLLECTION  (NEW — no official API, scraped)
+# ============================================================
+
+def flashback_search_url(term, page=1):
+
+    return (
+        f"{FLASHBACK_BASE_URL}/search.php"
+        f"?fresh&s={requests.utils.quote(term)}"
+        f"&p={page}"
+    )
+
+
+def parse_flashback_search_results(html, base_url=FLASHBACK_BASE_URL):
+    """
+    Parses a Flashback search-results page and returns a list of
+    (thread_url, thread_title) tuples.
+
+    Flashback's markup changes periodically since it isn't a
+    stable API — this looks for anchor tags whose href contains
+    "/t" (Flashback's thread URL pattern, e.g. /t1234567) and
+    filters out navigation/duplicate links. If this stops finding
+    threads, the site's HTML has likely changed and the selector
+    below needs updating.
+    """
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    seen = set()
+    threads = []
+
+    for link in soup.find_all("a", href=True):
+
+        href = link["href"]
+
+        if not re.search(r"/t\d+", href):
+            continue
+
+        title = normalize_text(link.get_text())
+
+        if not title or len(title) < 5:
+            continue
+
+        full_url = href if href.startswith("http") else (
+            base_url + href
+        )
+
+        # Collapse to the thread root (strip page/post fragments)
+        # so the same thread found on multiple result rows is
+        # only queued once.
+        thread_root = re.sub(r"(#.*|&p=\d+)$", "", full_url)
+
+        if thread_root in seen:
+            continue
+
+        seen.add(thread_root)
+
+        threads.append((thread_root, title))
+
+    return threads
+
+
+def parse_flashback_thread(html):
+    """
+    Parses a Flashback thread page and returns a list of dicts,
+    one per post: {post_id, author, text, posted_at}.
+
+    Like the search parser, this is tied to Flashback's current
+    HTML structure (post containers keyed by an id starting with
+    "post_message") and will need adjusting if the site's markup
+    changes.
+    """
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    posts = []
+
+    for message_div in soup.find_all(
+        "div",
+        id=re.compile(r"^post_message_\d+"),
+    ):
+
+        post_id = message_div["id"].replace(
+            "post_message_",
+            "",
+        )
+
+        text = normalize_text(
+            message_div.get_text(" ", strip=True)
+        )
+
+        if not text:
+            continue
+
+        # Author and timestamp live in nearby sibling elements on
+        # Flashback's post layout; fall back to blank if the
+        # structure doesn't match rather than failing the post.
+        author = ""
+        posted_at = ""
+
+        author_tag = soup.find(
+            "a",
+            attrs={"data-author-id": True},
+            href=re.compile(rf"post{post_id}|#post{post_id}"),
+        )
+
+        if author_tag:
+            author = normalize_text(author_tag.get_text())
+
+        posts.append(
+            {
+                "post_id": post_id,
+                "author": author,
+                "text": text,
+                "posted_at": posted_at,
+            }
+        )
+
+    return posts
+
+
+def collect_flashback(
+    threads_per_term=DEFAULT_FLASHBACK_THREADS_PER_TERM,
+    posts_per_thread=DEFAULT_FLASHBACK_POSTS_PER_THREAD,
+):
+    """
+    Scrapes Flashback search results and thread pages for the
+    configured search terms. There is no official Flashback API,
+    so this depends entirely on the site's current public HTML
+    and can break silently if that markup changes — failures are
+    caught per-thread/per-term so one bad page doesn't stop the
+    whole run.
+
+    Kept deliberately modest (small thread/post counts, a delay
+    between requests) since aggressive scraping is the most
+    likely way to get the collecting IP blocked.
+    """
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    count = 0
+    errors = []
+
+    try:
+
+        for term in FLASHBACK_SEARCH_TERMS:
+
+            try:
+
+                search_url = flashback_search_url(term)
+
+                response = requests.get(
+                    search_url,
+                    headers=FLASHBACK_HEADERS,
+                    timeout=15,
+                )
+
+                if response.status_code != 200:
+                    errors.append(
+                        f"{term}: search returned "
+                        f"HTTP {response.status_code}"
+                    )
+                    continue
+
+                time.sleep(FLASHBACK_REQUEST_DELAY_SECONDS)
+
+                threads = parse_flashback_search_results(
+                    response.text
+                )[:threads_per_term]
+
+                for thread_url, thread_title in threads:
+
+                    try:
+
+                        thread_response = requests.get(
+                            thread_url,
+                            headers=FLASHBACK_HEADERS,
+                            timeout=15,
+                        )
+
+                        if thread_response.status_code != 200:
+                            continue
+
+                        time.sleep(
+                            FLASHBACK_REQUEST_DELAY_SECONDS
+                        )
+
+                        thread_id_match = re.search(
+                            r"/t(\d+)",
+                            thread_url,
+                        )
+
+                        thread_id = (
+                            thread_id_match.group(1)
+                            if thread_id_match
+                            else thread_url
+                        )
+
+                        posts = parse_flashback_thread(
+                            thread_response.text
+                        )[:posts_per_thread]
+
+                        for post in posts:
+
+                            post_key = (
+                                f"fb_{thread_id}_"
+                                f"{post['post_id']}"
+                            )
+
+                            combined_text = (
+                                f"{thread_title} {post['text']}"
+                            )
+
+                            party = detect_party(
+                                combined_text
+                            )
+                            leader = detect_leader(
+                                combined_text
+                            )
+                            issue = detect_issue(
+                                combined_text
+                            )
+
+                            cursor.execute(
+                                """
+                                INSERT OR IGNORE INTO flashback_posts
+                                (
+                                    id,
+                                    thread_id,
+                                    thread_title,
+                                    thread_url,
+                                    author,
+                                    text,
+                                    post_number,
+                                    posted_at,
+                                    party_mentioned,
+                                    leader_mentioned,
+                                    issue_mentioned
+                                )
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    post_key,
+                                    thread_id,
+                                    thread_title,
+                                    thread_url,
+                                    post["author"],
+                                    post["text"],
+                                    0,
+                                    post["posted_at"],
+                                    party,
+                                    leader,
+                                    issue,
+                                ),
+                            )
+
+                            if cursor.rowcount > 0:
+                                count += 1
+
+                    except Exception as e:
+                        errors.append(
+                            f"{thread_url}: {e}"
+                        )
+                        continue
+
+            except Exception as e:
+                errors.append(f"{term}: {e}")
+                continue
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
+    if count == 0 and errors:
+        return 0, f"Flashback scrape failed: {errors[0]}"
+
+    message = f"Collected {count} new Flashback posts."
+
+    if errors:
+        message += f" ({len(errors)} requests skipped due to errors.)"
+
+    return count, message
+
+
+# ============================================================
 # GOOGLE TRENDS COLLECTION  (NEW)
 # ============================================================
 
@@ -1236,6 +1586,36 @@ def collect_all_data(
     )
 
 
+def record_flashback_run(flashback_count):
+    """
+    Logs a Flashback-only collection run to the same
+    collection_runs history table used by the Reddit/YouTube
+    collector, so it shows up in Collection History alongside
+    the other sources.
+    """
+
+    conn = get_connection()
+
+    try:
+
+        conn.execute(
+            """
+            INSERT INTO collection_runs
+            (reddit_count, youtube_count, flashback_count, total_new)
+            VALUES (0, 0, ?, ?)
+            """,
+            (
+                flashback_count,
+                flashback_count,
+            ),
+        )
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
+
 # ============================================================
 # SENTIMENT ANALYSIS
 # ============================================================
@@ -1331,6 +1711,48 @@ def analyze_database():
 
             analyzed += 1
 
+        # -------------------------
+        # FLASHBACK
+        # -------------------------
+
+        cursor.execute(
+            """
+            SELECT id, thread_title, text
+            FROM flashback_posts
+            WHERE sentiment_label IS NULL
+            LIMIT 300
+            """
+        )
+
+        flashback_posts = cursor.fetchall()
+
+        for post_id, thread_title, text in flashback_posts:
+
+            combined = normalize_text(
+                f"{thread_title or ''} {text or ''}"
+            )
+
+            label, score = sentiment_one(
+                classifier,
+                combined,
+            )
+
+            cursor.execute(
+                """
+                UPDATE flashback_posts
+                SET sentiment_label=?,
+                    sentiment_score=?
+                WHERE id=?
+                """,
+                (
+                    label,
+                    score,
+                    post_id,
+                ),
+            )
+
+            analyzed += 1
+
         conn.commit()
 
     finally:
@@ -1387,7 +1809,12 @@ def count_pending_analysis():
         )
         youtube_pending = cursor.fetchone()[0]
 
-        return reddit_pending + youtube_pending
+        cursor.execute(
+            "SELECT COUNT(*) FROM flashback_posts WHERE sentiment_label IS NULL"
+        )
+        flashback_pending = cursor.fetchone()[0]
+
+        return reddit_pending + youtube_pending + flashback_pending
 
     finally:
         conn.close()
@@ -1447,10 +1874,31 @@ def load_all_data():
             conn,
         )
 
+        flashback_df = pd.read_sql_query(
+            """
+            SELECT
+                id,
+                thread_id,
+                thread_title,
+                thread_url,
+                author,
+                text,
+                posted_at,
+                sentiment_label,
+                sentiment_score,
+                party_mentioned,
+                leader_mentioned,
+                issue_mentioned,
+                collected_at
+            FROM flashback_posts
+            """,
+            conn,
+        )
+
     finally:
         conn.close()
 
-    return reddit_df, youtube_df
+    return reddit_df, youtube_df, flashback_df
 
 
 @st.cache_data(ttl=30)
@@ -1476,7 +1924,7 @@ def load_collection_history():
 
 def prepare_all_data():
 
-    reddit_df, youtube_df = load_all_data()
+    reddit_df, youtube_df, flashback_df = load_all_data()
 
     frames = []
 
@@ -1559,6 +2007,60 @@ def prepare_all_data():
 
         frames.append(
             youtube[
+                [
+                    "source",
+                    "display_text",
+                    "sentiment_label",
+                    "sentiment_score",
+                    "party_mentioned",
+                    "leader_mentioned",
+                    "issue_mentioned",
+                    "engagement",
+                    "popularity",
+                    "collected_at",
+                    "title",
+                    "subreddit",
+                    "score",
+                    "num_comments",
+                    "url",
+                    "permalink",
+                ]
+            ]
+        )
+
+    if not flashback_df.empty:
+
+        flashback = flashback_df.copy()
+
+        flashback["source"] = "Flashback"
+
+        flashback["display_text"] = (
+            flashback["thread_title"].fillna("")
+            + " "
+            + flashback["text"].fillna("")
+        )
+
+        # Flashback's public pages don't expose like/upvote
+        # counts, so engagement here is presence-only (every
+        # post counts as 1) rather than a popularity signal like
+        # Reddit score or YouTube likes.
+        flashback["engagement"] = 1
+        flashback["popularity"] = 0
+
+        flashback["title"] = flashback["thread_title"]
+
+        flashback["subreddit"] = ""
+
+        flashback["score"] = 0
+
+        flashback["num_comments"] = 0
+
+        flashback["url"] = flashback["thread_url"].fillna("")
+
+        flashback["permalink"] = ""
+
+        frames.append(
+            flashback[
                 [
                     "source",
                     "display_text",
@@ -2433,6 +2935,61 @@ def show_sidebar():
                 st.success(trends_msg)
             else:
                 st.error(trends_msg)
+
+        st.markdown("---")
+
+        st.subheader("🗨️ Flashback")
+
+        st.caption(
+            "No official API — scraped directly. Keep this "
+            "infrequent; aggressive scraping is the likeliest "
+            "way to get the collecting IP blocked."
+        )
+
+        flashback_threads = st.slider(
+            "Threads per search term",
+            min_value=1,
+            max_value=10,
+            value=DEFAULT_FLASHBACK_THREADS_PER_TERM,
+            step=1,
+        )
+
+        flashback_posts_per_thread = st.slider(
+            "Posts per thread",
+            min_value=5,
+            max_value=50,
+            value=DEFAULT_FLASHBACK_POSTS_PER_THREAD,
+            step=5,
+        )
+
+        if st.button(
+            "🗨️ Fetch Flashback Posts",
+            use_container_width=True,
+        ):
+
+            with st.spinner(
+                "Scraping Flashback search results and "
+                "threads... this can take a few minutes."
+            ):
+
+                (
+                    flashback_count,
+                    flashback_msg,
+                ) = collect_flashback(
+                    flashback_threads,
+                    flashback_posts_per_thread,
+                )
+
+                record_flashback_run(flashback_count)
+
+            load_all_data.clear()
+            load_collection_history.clear()
+            count_pending_analysis.clear()
+
+            if flashback_count > 0:
+                st.success(flashback_msg)
+            else:
+                st.error(flashback_msg)
 
         st.markdown("---")
 
