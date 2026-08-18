@@ -29,10 +29,18 @@ except ImportError:
     build = None
 
 # Google Trends (unofficial API wrapper)
+# Google Trends (unofficial API wrapper). The original pytrends
+# is archived/dead and 429s on the first call, so this uses
+# pytrends-modern instead — an actively maintained successor with
+# a near-identical TrendReq/build_payload/interest_over_time API,
+# plus built-in proxy support and retry/backoff, which matters
+# since Streamlit Cloud's shared IPs are a common block target.
 try:
-    from pytrends.request import TrendReq
+    from pytrends_modern import TrendReq
+    from pytrends_modern.exceptions import TooManyRequestsError
 except ImportError:
     TrendReq = None
+    TooManyRequestsError = Exception
 
 
 # ============================================================
@@ -442,6 +450,23 @@ REDDIT_CLIENT_SECRET = get_secret(
 YOUTUBE_API_KEY = get_secret(
     "YOUTUBE_API_KEY",
     "YOUR_YOUTUBE_API_KEY",
+)
+
+# Optional proxy URLs for services that block shared cloud IPs
+# (Streamlit Cloud in particular). Leave unset to run without a
+# proxy — both collectors work proxy-less, just less reliably
+# from a datacenter IP.
+#
+# Format: "http://user:pass@host:port" or "http://host:port".
+# Set these in Streamlit's Secrets manager, not in code.
+GOOGLE_TRENDS_PROXY_URL = get_secret(
+    "GOOGLE_TRENDS_PROXY_URL",
+    None,
+)
+
+FLASHBACK_PROXY_URL = get_secret(
+    "FLASHBACK_PROXY_URL",
+    None,
 )
 
 
@@ -1260,7 +1285,12 @@ def collect_flashback(
 
     Kept deliberately modest (small thread/post counts, a delay
     between requests) since aggressive scraping is the most
-    likely way to get the collecting IP blocked.
+    likely way to get the collecting IP blocked. If
+    FLASHBACK_PROXY_URL is set as a secret, requests are routed
+    through it — datacenter IPs (Streamlit Cloud included) are
+    commonly blocked by Flashback outright regardless of request
+    volume, so a proxy is often the only real fix, not just a
+    rate-limiting workaround.
     """
 
     conn = get_connection()
@@ -1268,6 +1298,15 @@ def collect_flashback(
 
     count = 0
     errors = []
+
+    proxies = None
+
+    if FLASHBACK_PROXY_URL:
+
+        proxies = {
+            "http": FLASHBACK_PROXY_URL,
+            "https": FLASHBACK_PROXY_URL,
+        }
 
     try:
 
@@ -1280,6 +1319,7 @@ def collect_flashback(
                 response = requests.get(
                     search_url,
                     headers=FLASHBACK_HEADERS,
+                    proxies=proxies,
                     timeout=15,
                 )
 
@@ -1303,6 +1343,7 @@ def collect_flashback(
                         thread_response = requests.get(
                             thread_url,
                             headers=FLASHBACK_HEADERS,
+                            proxies=proxies,
                             timeout=15,
                         )
 
@@ -1312,6 +1353,7 @@ def collect_flashback(
                         time.sleep(
                             FLASHBACK_REQUEST_DELAY_SECONDS
                         )
+
 
                         thread_id_match = re.search(
                             r"/t(\d+)",
@@ -1421,10 +1463,13 @@ def collect_google_trends(
 ):
     """
     Pulls Google search-interest-over-time for each party name,
-    scoped to Sweden. Uses pytrends, an unofficial wrapper around
-    Google Trends (no API key required, but it can be rate-limited
-    or temporarily blocked, especially from shared cloud IPs like
-    Streamlit Community Cloud — retry later if it fails).
+    scoped to Sweden. Uses pytrends-modern (the original pytrends
+    is archived/dead and 429s immediately) — still an unofficial
+    wrapper around Google Trends, so it can still be rate-limited
+    or blocked, especially from shared cloud IPs like Streamlit
+    Community Cloud. If GOOGLE_TRENDS_PROXY_URL is set as a
+    secret, requests are routed through it, which is the main
+    lever for getting this to work reliably from a datacenter IP.
 
     Interest is Google's own 0-100 relative scale, not raw search
     volume, and it's rescaled per request, so only compare terms
@@ -1433,11 +1478,12 @@ def collect_google_trends(
     """
 
     if TrendReq is None:
-        return 0, "pytrends is not installed."
+        return 0, "pytrends-modern is not installed."
 
     terms = list(SWEDISH_PARTIES.keys())
 
-    # pytrends allows a maximum of 5 terms per payload.
+    # pytrends-modern allows a maximum of 5 terms per payload,
+    # same limit as the original pytrends.
     chunks = [terms[i:i + 5] for i in range(0, len(terms), 5)]
 
     conn = get_connection()
@@ -1448,14 +1494,28 @@ def collect_google_trends(
 
     try:
 
-        pytrends = TrendReq(hl="sv-SE", tz=60)
+        trend_client_kwargs = {
+            "hl": "sv-SE",
+            "tz": 60,
+            "retries": 3,
+            "backoff_factor": 0.5,
+        }
+
+        if GOOGLE_TRENDS_PROXY_URL:
+
+            trend_client_kwargs["proxies"] = {
+                "http": GOOGLE_TRENDS_PROXY_URL,
+                "https": GOOGLE_TRENDS_PROXY_URL,
+            }
+
+        pytrends = TrendReq(**trend_client_kwargs)
 
         for chunk in chunks:
 
             try:
 
                 pytrends.build_payload(
-                    chunk,
+                    kw_list=chunk,
                     timeframe=timeframe,
                     geo=geo,
                 )
@@ -1492,7 +1552,15 @@ def collect_google_trends(
                         count += 1
 
                 # Be polite to Google's rate limits between batches.
+                # pytrends-modern already retries/backs off inside
+                # build_payload, so this is on top of that.
                 time.sleep(1.5)
+
+            except TooManyRequestsError as e:
+                errors.append(
+                    f"Rate limited by Google Trends: {e}"
+                )
+                continue
 
             except Exception as e:
                 errors.append(str(e))
@@ -2917,6 +2985,14 @@ def show_sidebar():
             "cloud IPs. Retry later if a fetch fails."
         )
 
+        if GOOGLE_TRENDS_PROXY_URL:
+            st.caption("🟢 Proxy configured.")
+        else:
+            st.caption(
+                "⚪ No proxy configured (GOOGLE_TRENDS_PROXY_URL "
+                "secret) — running from this app's own IP."
+            )
+
         if st.button(
             "📈 Fetch Google Trends",
             use_container_width=True,
@@ -2945,6 +3021,15 @@ def show_sidebar():
             "infrequent; aggressive scraping is the likeliest "
             "way to get the collecting IP blocked."
         )
+
+        if FLASHBACK_PROXY_URL:
+            st.caption("🟢 Proxy configured.")
+        else:
+            st.caption(
+                "⚪ No proxy configured (FLASHBACK_PROXY_URL "
+                "secret) — datacenter IPs are commonly blocked "
+                "by Flashback outright."
+            )
 
         flashback_threads = st.slider(
             "Threads per search term",
@@ -4032,92 +4117,4 @@ def show_dashboard():
     # CAMPAIGN INTELLIGENCE BRIEF
     # ========================================================
 
-    st.subheader("📋 Intelligence Brief")
-
-    st.caption(
-        "This is a neutral monitoring summary of the "
-        "online conversation captured by the app."
-    )
-
-    if st.button(
-        "📝 Generate Intelligence Brief",
-        use_container_width=True,
-    ):
-
-        brief = generate_intelligence_brief(
-            analyzed,
-            trends,
-            bloc_summary,
-        )
-
-        st.markdown(brief)
-
-        st.download_button(
-            "⬇️ Download Brief",
-            brief,
-            file_name="swedish_election_intelligence_brief.md",
-            mime="text/markdown",
-        )
-
-    # ========================================================
-    # RECENT CONTENT
-    # ========================================================
-
-    st.subheader("🗣️ Recent Conversation")
-
-    recent = analyzed.sort_values(
-        "collected_at",
-        ascending=False,
-    ).head(100)
-
-    st.dataframe(
-        recent[
-            [
-                "collected_at",
-                "source",
-                "sentiment_label",
-                "sentiment_score",
-                "party_mentioned",
-                "leader_mentioned",
-                "issue_mentioned",
-                "engagement",
-                "title",
-                "display_text",
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    # ========================================================
-    # DOWNLOAD DATA
-    # ========================================================
-
-    st.subheader("💾 Export Data")
-
-    csv = df.to_csv(
-        index=False
-    ).encode("utf-8")
-
-    st.download_button(
-        "⬇️ Download CSV",
-        csv,
-        file_name="swedish_election_intelligence.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-
-# ============================================================
-# APPLICATION START
-# ============================================================
-
-def main():
-
-    init_database()
-
-    show_dashboard()
-
-
-if __name__ == "__main__":
-    main()
+  
