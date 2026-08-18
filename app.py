@@ -19,7 +19,7 @@ from plotly.subplots import make_subplots
 from wordcloud import WordCloud
 from transformers import pipeline
 
-# Optional advanced libraries
+# Optional advanced libraries – will be disabled if missing
 try:
     import gensim
     from gensim import corpora, models
@@ -52,7 +52,6 @@ try:
 except ImportError:
     build = None
 
-# Google Trends (unofficial API wrapper)
 try:
     from pytrends_modern import TrendReq
     from pytrends_modern.exceptions import TooManyRequestsError
@@ -86,14 +85,18 @@ DEFAULT_REDDIT_LIMIT = 80
 DEFAULT_YOUTUBE_RESULTS = 10
 DEFAULT_YOUTUBE_COMMENTS = 20
 
-MODEL_NAME = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
+# Use a smaller sentiment model to save memory
+MODEL_NAME = "cardiffnlp/twitter-xlm-roberta-base-sentiment"  # ~500 MB
+# If memory is still an issue, switch to:
+# MODEL_NAME = "distilbert-base-uncased-finetuned-sst-2-english"  # ~67 MB
+
 MIN_MENTIONS_FOR_ALERT = 5
 GOOGLE_TRENDS_TIMEFRAME = "today 3-m"
 GOOGLE_TRENDS_GEO = "SE"
 
 
 # ============================================================
-# PARTY DATA
+# PARTY DATA (unchanged – keep as before)
 # ============================================================
 
 SWEDISH_PARTIES = {
@@ -194,7 +197,7 @@ FLASHBACK_PROXY_URL = get_secret("FLASHBACK_PROXY_URL", None)
 
 
 # ============================================================
-# DATABASE
+# DATABASE (unchanged – keep as before)
 # ============================================================
 
 def get_connection():
@@ -316,7 +319,7 @@ def init_database():
 
 
 # ============================================================
-# TEXT HELPERS
+# TEXT HELPERS (unchanged)
 # ============================================================
 
 def normalize_text(text):
@@ -393,7 +396,7 @@ def sentiment_one(classifier, text):
 
 
 # ============================================================
-# ADVANCED ANALYTICS FUNCTIONS
+# ADVANCED ANALYTICS – with graceful fallback if libs missing
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
@@ -405,7 +408,8 @@ def load_spacy_model():
         return nlp
     except OSError:
         try:
-            spacy.cli.download("sv_core_news_sm")
+            import subprocess
+            subprocess.run(["python", "-m", "spacy", "download", "sv_core_news_sm"], check=True)
             return spacy.load("sv_core_news_sm")
         except:
             return None
@@ -453,7 +457,7 @@ def detect_anomalies(df, column='party_mentioned', window=7, z_thresh=3):
     return daily[daily['anomaly']]
 
 def forecast_simple(series, days=7):
-    if len(series) < 3:
+    if not SKLEARN_AVAILABLE or len(series) < 3:
         return None
     X = np.arange(len(series)).reshape(-1, 1)
     y = series.values
@@ -464,7 +468,7 @@ def forecast_simple(series, days=7):
 
 
 # ============================================================
-# REDDIT COLLECTION
+# COLLECTION FUNCTIONS (unchanged – keep as before)
 # ============================================================
 
 def collect_reddit(limit=DEFAULT_REDDIT_LIMIT):
@@ -527,10 +531,6 @@ def collect_reddit(limit=DEFAULT_REDDIT_LIMIT):
     return count, f"Collected {count} new Reddit posts."
 
 
-# ============================================================
-# YOUTUBE COLLECTION
-# ============================================================
-
 def collect_youtube(max_results=DEFAULT_YOUTUBE_RESULTS, comments_per_video=DEFAULT_YOUTUBE_COMMENTS):
     if build is None:
         return 0, "Google API client not installed."
@@ -592,10 +592,6 @@ def collect_youtube(max_results=DEFAULT_YOUTUBE_RESULTS, comments_per_video=DEFA
         conn.close()
     return count, f"Collected {count} new YouTube comments."
 
-
-# ============================================================
-# FLASHBACK COLLECTION
-# ============================================================
 
 def flashback_search_url(term, page=1):
     return f"{FLASHBACK_BASE_URL}/search.php?fresh&s={requests.utils.quote(term)}&p={page}"
@@ -703,10 +699,6 @@ def collect_flashback(threads_per_term=DEFAULT_FLASHBACK_THREADS_PER_TERM, posts
     return count, msg
 
 
-# ============================================================
-# GOOGLE TRENDS COLLECTION
-# ============================================================
-
 def collect_google_trends(timeframe=GOOGLE_TRENDS_TIMEFRAME, geo=GOOGLE_TRENDS_GEO):
     if TrendReq is None:
         return 0, "pytrends-modern is not installed."
@@ -752,10 +744,6 @@ def collect_google_trends(timeframe=GOOGLE_TRENDS_TIMEFRAME, geo=GOOGLE_TRENDS_G
         return 0, f"Google Trends fetch failed: {errors[0]}"
     return count, f"Collected {count} Google Trends data points."
 
-
-# ============================================================
-# COLLECTION RUNS
-# ============================================================
 
 def record_collection_run(reddit_count, youtube_count, flashback_count=0):
     conn = get_connection()
@@ -889,7 +877,7 @@ def load_google_trends():
 
 
 # ============================================================
-# PREPARE DATA
+# PREPARE DATA (unchanged)
 # ============================================================
 
 def prepare_all_data():
@@ -949,7 +937,7 @@ def prepare_all_data():
 
 
 # ============================================================
-# CORE DASHBOARD HELPERS
+# CORE DASHBOARD HELPERS (unchanged)
 # ============================================================
 
 def percentage(part, total):
@@ -1247,6 +1235,17 @@ def show_sidebar():
 
         st.markdown("---")
         st.subheader("🔬 Advanced Analytics")
+        # Only show buttons if the required libraries are available, but always show with a warning if not.
+        advanced_status = []
+        if not GENSIM_AVAILABLE:
+            advanced_status.append("Topic modelling disabled (gensim missing)")
+        if not SPACY_AVAILABLE:
+            advanced_status.append("NER disabled (spacy missing)")
+        if not SKLEARN_AVAILABLE:
+            advanced_status.append("Forecast disabled (scikit-learn missing)")
+        if advanced_status:
+            st.caption("⚠️ " + " | ".join(advanced_status))
+
         if st.button("🧠 Run Topic Modelling", use_container_width=True):
             st.session_state['run_topic'] = True
         if st.button("🏷️ Run NER", use_container_width=True):
@@ -1546,44 +1545,50 @@ def show_dashboard():
     st.text(brief)
 
     # ============================================================
-    # ADVANCED ANALYTICS SECTIONS (triggered by sidebar buttons)
+    # ADVANCED ANALYTICS SECTIONS (with proper fallback messages)
     # ============================================================
 
     # Topic Modelling
     if st.session_state.get('run_topic', False):
         st.subheader("🧠 Topic Modelling (LDA)")
-        with st.spinner("Running LDA on collected texts..."):
-            texts = df['display_text'].dropna().tolist()
-            if len(texts) > 10:
-                topics, model = run_topic_modeling(texts, num_topics=8)
-                if topics:
-                    for idx, (topic_id, words) in enumerate(topics):
-                        st.markdown(f"**Topic {idx+1}:** {words}")
+        if not GENSIM_AVAILABLE:
+            st.error("Topic modelling is disabled because 'gensim' is not installed.")
+        else:
+            with st.spinner("Running LDA on collected texts..."):
+                texts = df['display_text'].dropna().tolist()
+                if len(texts) > 10:
+                    topics, model = run_topic_modeling(texts, num_topics=8)
+                    if topics:
+                        for idx, (topic_id, words) in enumerate(topics):
+                            st.markdown(f"**Topic {idx+1}:** {words}")
+                    else:
+                        st.info("Not enough text for topic modelling.")
                 else:
-                    st.info("Not enough text for topic modelling.")
-            else:
-                st.warning("Need more data (at least 10 texts).")
+                    st.warning("Need more data (at least 10 texts).")
         st.session_state['run_topic'] = False
 
     # NER
     if st.session_state.get('run_ner', False):
         st.subheader("🏷️ Named Entity Recognition")
-        nlp = load_spacy_model()
-        if nlp is None:
-            st.error("spaCy Swedish model not available. Please install 'sv_core_news_sm'.")
+        if not SPACY_AVAILABLE:
+            st.error("NER is disabled because 'spacy' is not installed.")
         else:
-            with st.spinner("Extracting entities..."):
-                texts = df['display_text'].dropna().tolist()[:200]
-                entities = run_ner(texts, nlp)
-                if entities:
-                    ent_df = pd.DataFrame(entities, columns=['Entity', 'Type'])
-                    ent_counts = ent_df.groupby(['Entity', 'Type']).size().reset_index(name='Count')
-                    st.dataframe(ent_counts.sort_values('Count', ascending=False).head(20), use_container_width=True)
-                else:
-                    st.info("No entities found.")
+            nlp = load_spacy_model()
+            if nlp is None:
+                st.error("Swedish spaCy model could not be loaded. Please install 'sv_core_news_sm'.")
+            else:
+                with st.spinner("Extracting entities..."):
+                    texts = df['display_text'].dropna().tolist()[:200]
+                    entities = run_ner(texts, nlp)
+                    if entities:
+                        ent_df = pd.DataFrame(entities, columns=['Entity', 'Type'])
+                        ent_counts = ent_df.groupby(['Entity', 'Type']).size().reset_index(name='Count')
+                        st.dataframe(ent_counts.sort_values('Count', ascending=False).head(20), use_container_width=True)
+                    else:
+                        st.info("No entities found.")
         st.session_state['run_ner'] = False
 
-    # Anomaly Detection
+    # Anomaly Detection (this doesn't need external libs, works fine)
     if st.session_state.get('run_anomaly', False):
         st.subheader("📈 Anomaly Detection (Z-score)")
         if not df.empty:
@@ -1599,7 +1604,7 @@ def show_dashboard():
             st.warning("No data.")
         st.session_state['run_anomaly'] = False
 
-    # Co-occurrence Network (heatmap)
+    # Co-occurrence Network (heatmap) – also doesn't require extra libs
     if st.session_state.get('run_network', False):
         st.subheader("🔗 Party-Issue Co-occurrence Network")
         subset = df[df['party_mentioned'].notna() & df['issue_mentioned'].notna()]
@@ -1615,22 +1620,25 @@ def show_dashboard():
     # Forecast
     if st.session_state.get('run_forecast', False):
         st.subheader("📉 7-Day Forecast")
-        df['date'] = pd.to_datetime(df['collected_at']).dt.date
-        daily_sent = df.groupby('date')['sentiment_score'].mean().dropna()
-        if len(daily_sent) > 2:
-            pred = forecast_simple(daily_sent, days=7)
-            if pred is not None:
-                future_dates = [daily_sent.index[-1] + timedelta(days=i+1) for i in range(7)]
-                forecast_df = pd.DataFrame({'date': future_dates, 'predicted_sentiment': pred})
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=daily_sent.index, y=daily_sent.values, mode='lines+markers', name='Historical'))
-                fig.add_trace(go.Scatter(x=forecast_df['date'], y=forecast_df['predicted_sentiment'], mode='lines+markers', name='Forecast', line=dict(dash='dash')))
-                fig.update_layout(title='Sentiment Forecast (7 days)')
-                st.plotly_chart(fig)
-            else:
-                st.warning("Not enough data for forecast.")
+        if not SKLEARN_AVAILABLE:
+            st.error("Forecast is disabled because 'scikit-learn' is not installed.")
         else:
-            st.warning("Need at least 3 days of data.")
+            df['date'] = pd.to_datetime(df['collected_at']).dt.date
+            daily_sent = df.groupby('date')['sentiment_score'].mean().dropna()
+            if len(daily_sent) > 2:
+                pred = forecast_simple(daily_sent, days=7)
+                if pred is not None:
+                    future_dates = [daily_sent.index[-1] + timedelta(days=i+1) for i in range(7)]
+                    forecast_df = pd.DataFrame({'date': future_dates, 'predicted_sentiment': pred})
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=daily_sent.index, y=daily_sent.values, mode='lines+markers', name='Historical'))
+                    fig.add_trace(go.Scatter(x=forecast_df['date'], y=forecast_df['predicted_sentiment'], mode='lines+markers', name='Forecast', line=dict(dash='dash')))
+                    fig.update_layout(title='Sentiment Forecast (7 days)')
+                    st.plotly_chart(fig)
+                else:
+                    st.warning("Not enough data for forecast.")
+            else:
+                st.warning("Need at least 3 days of data.")
         st.session_state['run_forecast'] = False
 
 
