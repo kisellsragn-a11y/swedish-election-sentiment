@@ -10,3 +10,6 @@ google-api-python-client>=2.100.0
 beautifulsoup4>=4.12.0
 pytrends-modern>=0.1.0
 requests>=2.31.0
+gensim>=4.3.0          # optional – for topic modelling
+spacy>=3.6.0           # optional – for NER
+scikit-learn>=1.3.0    # optional – for forecasting
