@@ -14,10 +14,10 @@ from bs4 import BeautifulSoup
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-
 from wordcloud import WordCloud
-from transformers import pipeline
+
+# Use an alias to avoid conflict with local "sentiment" module
+from transformers import pipeline as transformers_pipeline
 
 # Optional advanced libraries – will be disabled if missing
 try:
@@ -85,10 +85,10 @@ DEFAULT_REDDIT_LIMIT = 80
 DEFAULT_YOUTUBE_RESULTS = 10
 DEFAULT_YOUTUBE_COMMENTS = 20
 
-# Use a smaller sentiment model to save memory if needed
-MODEL_NAME = "cardiffnlp/twitter-xlm-roberta-base-sentiment"  # ~500 MB
-# If memory is still an issue, switch to:
-# MODEL_NAME = "distilbert-base-uncased-finetuned-sst-2-english"  # ~67 MB
+# Use a small English model to save memory (67 MB)
+# For better Swedish support, you can switch to:
+# "cardiffnlp/twitter-xlm-roberta-base-sentiment" (500 MB)
+MODEL_NAME = "distilbert-base-uncased-finetuned-sst-2-english"
 
 MIN_MENTIONS_FOR_ALERT = 5
 GOOGLE_TRENDS_TIMEFRAME = "today 3-m"
@@ -96,7 +96,7 @@ GOOGLE_TRENDS_GEO = "SE"
 
 
 # ============================================================
-# PARTY DATA (unchanged)
+# PARTY DATA
 # ============================================================
 
 SWEDISH_PARTIES = {
@@ -201,10 +201,9 @@ FLASHBACK_PROXY_URL = get_secret("FLASHBACK_PROXY_URL", None)
 # ============================================================
 
 def get_connection():
-    # Increased timeout and busy_timeout to reduce locking issues
     conn = sqlite3.connect(DB_PATH, timeout=60, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=60000")  # 60 seconds
+    conn.execute("PRAGMA busy_timeout=60000")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
@@ -306,7 +305,6 @@ def init_database():
                 collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Add indexes for speed
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_reddit_collected ON reddit_posts(collected_at)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_reddit_party ON reddit_posts(party_mentioned)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_reddit_sentiment ON reddit_posts(sentiment_label)")
@@ -372,12 +370,13 @@ def get_bloc(party_name):
 
 
 # ============================================================
-# SENTIMENT MODEL
+# SENTIMENT MODEL (using alias)
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
 def load_sentiment_model():
-    return pipeline("sentiment-analysis", model=MODEL_NAME, tokenizer=MODEL_NAME)
+    # Use the aliased pipeline to avoid conflict
+    return transformers_pipeline("sentiment-analysis", model=MODEL_NAME, tokenizer=MODEL_NAME)
 
 def sentiment_one(classifier, text):
     text = normalize_text(text)
@@ -397,18 +396,17 @@ def sentiment_one(classifier, text):
 
 
 # ============================================================
-# DATABASE RETRY HELPER (NEW)
+# DATABASE RETRY HELPER
 # ============================================================
 
 def execute_with_retry(cursor, query, params, retries=5):
-    """Execute a SQL statement with retries if the database is locked."""
     for attempt in range(retries):
         try:
             cursor.execute(query, params)
             return
         except sqlite3.OperationalError as e:
             if "database is locked" in str(e).lower() and attempt < retries - 1:
-                time.sleep(0.5 * (attempt + 1))  # progressive backoff
+                time.sleep(0.5 * (attempt + 1))
             else:
                 raise
 
@@ -1284,7 +1282,6 @@ def show_sidebar():
 
         st.markdown("---")
         st.subheader("🔬 Advanced Analytics")
-        # Show status of optional libraries
         advanced_status = []
         if not GENSIM_AVAILABLE:
             advanced_status.append("Topic modelling disabled (gensim missing)")
