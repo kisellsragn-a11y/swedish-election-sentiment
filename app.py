@@ -16,6 +16,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 from wordcloud import WordCloud
 
+# Import torch explicitly to avoid NameError in transformers
+import torch
+
 # Use an alias to avoid conflict with local "sentiment" module
 from transformers import pipeline as transformers_pipeline
 
@@ -370,13 +373,18 @@ def get_bloc(party_name):
 
 
 # ============================================================
-# SENTIMENT MODEL (using alias)
+# SENTIMENT MODEL (with torch imported and device set to CPU)
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
 def load_sentiment_model():
-    # Use the aliased pipeline to avoid conflict
-    return transformers_pipeline("sentiment-analysis", model=MODEL_NAME, tokenizer=MODEL_NAME)
+    # Force CPU to avoid CUDA issues
+    return transformers_pipeline(
+        "sentiment-analysis",
+        model=MODEL_NAME,
+        tokenizer=MODEL_NAME,
+        device=-1  # CPU
+    )
 
 def sentiment_one(classifier, text):
     text = normalize_text(text)
@@ -1591,7 +1599,7 @@ def show_dashboard():
     st.text(brief)
 
     # ============================================================
-    # ADVANCED ANALYTICS SECTIONS (triggered by sidebar buttons)
+    # ADVANCED ANALYTICS SECTIONS
     # ============================================================
 
     # Topic Modelling
@@ -1650,7 +1658,7 @@ def show_dashboard():
             st.warning("No data.")
         st.session_state['run_anomaly'] = False
 
-    # Co-occurrence Network (heatmap)
+    # Co-occurrence Network
     if st.session_state.get('run_network', False):
         st.subheader("🔗 Party-Issue Co-occurrence Network")
         subset = df[df['party_mentioned'].notna() & df['issue_mentioned'].notna()]
